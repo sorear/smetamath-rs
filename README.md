@@ -15,6 +15,8 @@ Rust 1.11.0 or newer is recommended as SMM3 benefits measurably from the "non-fi
 At the time of writing, that requires a nightly build and the `-Z orbit` compiler flag, which is included in the `.cargo/config` file in this repository.
 If you are trying to use an older or newer stable build and `-Z orbit` is giving an error, delete `.cargo/config` and try again.
 
+If you are using stable, build with `--no-default-features` to avoid the hacked hash table implementation.
+
 ## Running
 
     # The largest known Metamath database, and best test case
