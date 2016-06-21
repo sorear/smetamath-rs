@@ -9,6 +9,7 @@ filetime = "0.1.10"
 fnv = "1.0.2"
 
 [features]
+default = ["exotic_hash"]
 exotic_hash = []
 
 [profile]

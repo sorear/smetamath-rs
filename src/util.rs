@@ -5,9 +5,15 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::ptr;
 use std::slice;
+#[cfg(feature = "exotic_hash")]
+use hash;
 
+#[cfg(not(feature = "exotic_hash"))]
 pub type HashMap<K, V> = collections::HashMap<K, V, BuildHasherDefault<FnvHasher>>;
 pub type HashSet<K> = collections::HashSet<K, BuildHasherDefault<FnvHasher>>;
+
+#[cfg(feature = "exotic_hash")]
+pub type HashMap<K, V> = hash::map::HashMap<K, V, BuildHasherDefault<FnvHasher>>;
 
 pub fn new_map<K, V>() -> HashMap<K, V>
     where K: Eq + Hash
