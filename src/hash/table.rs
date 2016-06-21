@@ -644,13 +644,13 @@ impl<K, V> RawTable<K, V> {
 
         // One check for overflow that covers calculation and rounding of size.
         let size_of_bucket = size_of::<u64>()
-                                 .checked_add(size_of::<K>())
-                                 .unwrap()
-                                 .checked_add(size_of::<V>())
-                                 .unwrap();
+            .checked_add(size_of::<K>())
+            .unwrap()
+            .checked_add(size_of::<V>())
+            .unwrap();
         assert!(size >=
                 capacity.checked_mul(size_of_bucket)
-                        .expect("capacity overflow"),
+                    .expect("capacity overflow"),
                 "capacity overflow");
 
         let buffer = allocate(size, malloc_alignment);
@@ -673,10 +673,8 @@ impl<K, V> RawTable<K, V> {
         let keys_size = self.capacity * size_of::<K>();
 
         let buffer = *self.hashes as *const u8;
-        let (keys_offset, vals_offset, oflo) = calculate_offsets(hashes_size,
-                                                                 keys_size,
-                                                                 align_of::<K>(),
-                                                                 align_of::<V>());
+        let (keys_offset, vals_offset, oflo) =
+            calculate_offsets(hashes_size, keys_size, align_of::<K>(), align_of::<V>());
         debug_assert!(!oflo, "capacity overflow");
         unsafe {
             RawBucket {
