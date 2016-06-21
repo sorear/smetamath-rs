@@ -1,3 +1,14 @@
+#![cfg_attr(feature = "exotic_hash", feature(alloc))]
+#![cfg_attr(feature = "exotic_hash", feature(core_intrinsics))]
+#![cfg_attr(feature = "exotic_hash", feature(dropck_parametricity))]
+#![cfg_attr(feature = "exotic_hash", feature(heap_api))]
+#![cfg_attr(feature = "exotic_hash", feature(unique))]
+#![cfg_attr(feature = "exotic_hash", feature(oom))]
+#![cfg_attr(feature = "exotic_hash", feature(filling_drop))]
+#![cfg_attr(feature = "exotic_hash", feature(unsafe_no_drop_flag))]
+
+#[cfg(feature = "exotic_hash")]
+extern crate alloc;
 #[macro_use]
 extern crate clap;
 extern crate filetime;
@@ -6,6 +17,8 @@ extern crate fnv;
 mod bit_set;
 mod database;
 mod diag;
+#[cfg(feature = "exotic_hash")]
+mod hash;
 mod nameck;
 mod parser;
 mod scopeck;
