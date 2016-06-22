@@ -1,4 +1,6 @@
 use database::DbOptions;
+use itoken::IToken;
+use itoken::ITokenRef;
 use std::borrow::Borrow;
 use std::hash::Hash;
 use std::sync::Arc;
@@ -72,21 +74,21 @@ struct LabelInfo {
 
 #[derive(Default,Debug,Clone)]
 struct AtomTable {
-    table: HashMap<Token, Atom>,
-    reverse: Vec<Token>,
+    table: HashMap<IToken, Atom>,
+    reverse: Vec<IToken>,
 }
 
-fn intern(table: &mut AtomTable, tok: TokenPtr) -> Atom {
+fn intern(table: &mut AtomTable, tok: &IToken) -> Atom {
     let next = Atom(table.table.len() as u32 + 1);
     match table.table.get(tok) {
         None => {}
         Some(atom) => return *atom,
     };
-    table.table.insert(tok.to_owned(), next);
+    table.table.insert(tok.clone(), next);
     if table.reverse.len() == 0 {
-        table.reverse.push(Token::new());
+        table.reverse.push(IToken::default());
     }
-    table.reverse.push(tok.to_owned());
+    table.reverse.push(tok.clone());
     next
 }
 
@@ -100,8 +102,8 @@ pub struct Nameset {
     dv_gen: usize,
     segments: HashMap<SegmentId, Arc<Segment>>,
     dv_info: NameSlot<StatementAddress, Vec<Atom>>,
-    labels: HashMap<Token, LabelInfo>,
-    symbols: HashMap<Token, SymbolInfo>,
+    labels: HashMap<IToken, LabelInfo>,
+    symbols: HashMap<IToken, SymbolInfo>,
 }
 
 impl Nameset {
@@ -147,10 +149,11 @@ impl Nameset {
         };
 
         for &ref symdef in &seg.symbols {
-            let slot = autoviv(&mut self.symbols, symdef.name.clone());
+            let name = IToken::from_slice(&symdef.name);
+            let slot = autoviv(&mut self.symbols, name.clone());
             slot.generation = self.generation;
             if slot.atom == Atom::default() {
-                slot.atom = intern(&mut self.atom_table, &symdef.name);
+                slot.atom = intern(&mut self.atom_table, &name);
             }
             let address = TokenAddress::new3(id, symdef.start, symdef.ordinal);
             slot_insert(&mut slot.all, &*self.order, address, symdef.stype);
@@ -160,17 +163,18 @@ impl Nameset {
         }
 
         for &ref lsymdef in &seg.local_vars {
-            let name = sref.statement(lsymdef.index).math_at(lsymdef.ordinal).slice;
-            intern(&mut self.atom_table, name);
+            let namesl = sref.statement(lsymdef.index).math_at(lsymdef.ordinal).slice;
+            let name = IToken::from_slice(namesl);
+            intern(&mut self.atom_table, &name);
         }
 
         for &ref labdef in &seg.labels {
             let labelr = sref.statement(labdef.index).label();
-            let label = labelr.to_owned();
-            let slot = autoviv(&mut self.labels, label);
+            let label = IToken::from_slice(labelr);
+            let slot = autoviv(&mut self.labels, label.clone());
             slot.generation = self.generation;
             if self.options.incremental && slot.atom == Atom::default() {
-                slot.atom = intern(&mut self.atom_table, labelr);
+                slot.atom = intern(&mut self.atom_table, &label);
             }
             slot_insert(&mut slot.labels,
                         &*self.order,
@@ -179,13 +183,14 @@ impl Nameset {
         }
 
         for &ref floatdef in &seg.floats {
-            let slot = autoviv(&mut self.symbols, floatdef.name.clone());
+            let name = IToken::from_slice(&floatdef.name);
+            let slot = autoviv(&mut self.symbols, name.clone());
             slot.generation = self.generation;
             if slot.atom == Atom::default() {
-                slot.atom = intern(&mut self.atom_table, &floatdef.name);
+                slot.atom = intern(&mut self.atom_table, &name);
             }
             let address = StatementAddress::new(id, floatdef.start);
-            let tcatom = intern(&mut self.atom_table, &floatdef.typecode);
+            let tcatom = intern(&mut self.atom_table, &IToken::from_slice(&floatdef.typecode));
             slot_insert(&mut slot.float,
                         &*self.order,
                         address,
@@ -193,7 +198,9 @@ impl Nameset {
         }
 
         for &ref dvdef in &seg.global_dvs {
-            let vars = dvdef.vars.iter().map(|v| intern(&mut self.atom_table, &v)).collect();
+            let vars = dvdef.vars.iter().map(|v| {
+                intern(&mut self.atom_table, &IToken::from_slice(v))
+            }).collect();
             self.dv_gen = self.generation;
             slot_insert(&mut self.dv_info,
                         &*self.order,
@@ -210,7 +217,8 @@ impl Nameset {
             };
             let gen = self.generation;
             for &ref symdef in &seg.symbols {
-                deviv(&mut self.symbols, &symdef.name, |slot| {
+                let name = ITokenRef::from(&symdef.name);
+                deviv(&mut self.symbols, name, |slot| {
                     let address = TokenAddress::new3(id, symdef.start, symdef.ordinal);
                     slot.generation = gen;
                     slot_remove(&mut slot.all, address);
@@ -220,14 +228,16 @@ impl Nameset {
 
             for &ref labdef in &seg.labels {
                 let label = sref.statement(labdef.index).label();
-                deviv(&mut self.labels, label, |slot| {
+                let labelt = ITokenRef::from(label);
+                deviv(&mut self.labels, labelt, |slot| {
                     slot.generation = gen;
                     slot_remove(&mut slot.labels, StatementAddress::new(id, labdef.index));
                 });
             }
 
             for &ref floatdef in &seg.floats {
-                deviv(&mut self.symbols, &floatdef.name, |slot| {
+                let name = ITokenRef::from(&floatdef.name);
+                deviv(&mut self.symbols, name, |slot| {
                     let address = StatementAddress::new(id, floatdef.start);
                     slot.generation = gen;
                     slot_remove(&mut slot.float, address);
@@ -242,10 +252,15 @@ impl Nameset {
     }
 
     pub fn get_atom(&self, name: TokenPtr) -> Atom {
-        self.atom_table.table.get(name).cloned().expect("please only use get_atom for local $v")
+        let namet = ITokenRef::from(name);
+        self.atom_table.table.get(namet).cloned().expect("please only use get_atom for local $v")
     }
 
     pub fn atom_name(&self, atom: Atom) -> TokenPtr {
+        &self.atom_table.reverse[atom.0 as usize].as_slice()
+    }
+
+    pub fn atom_name_itok(&self, atom: Atom) -> &IToken {
         &self.atom_table.reverse[atom.0 as usize]
     }
 }
@@ -254,18 +269,18 @@ pub struct NameReader<'a> {
     nameset: &'a Nameset,
     incremental: bool,
     found_symbol: HashSet<Atom>,
-    not_found_symbol: HashSet<Token>,
+    not_found_symbol: HashSet<IToken>,
     found_label: HashSet<Atom>,
-    not_found_label: HashSet<Token>,
+    not_found_label: HashSet<IToken>,
 }
 
 pub struct NameUsage {
     generation: usize,
     incremental: bool,
     found_symbol: HashSet<Atom>,
-    not_found_symbol: HashSet<Token>,
+    not_found_symbol: HashSet<IToken>,
     found_label: HashSet<Atom>,
-    not_found_label: HashSet<Token>,
+    not_found_label: HashSet<IToken>,
 }
 
 pub struct LookupLabel {
@@ -322,7 +337,8 @@ impl<'a> NameReader<'a> {
 
     // TODO: add versions which fetch less data, to reduce dep tracking overhead
     pub fn lookup_label(&mut self, label: TokenPtr) -> Option<LookupLabel> {
-        match self.nameset.labels.get(label) {
+        let labelt = ITokenRef::from(label);
+        match self.nameset.labels.get(labelt) {
             Some(&ref lslot) => {
                 if self.incremental {
                     self.found_label.insert(lslot.atom);
@@ -336,7 +352,7 @@ impl<'a> NameReader<'a> {
             }
             None => {
                 if self.incremental {
-                    self.not_found_label.insert(label.to_owned());
+                    self.not_found_label.insert(labelt.to_owned());
                 }
                 None
             }
@@ -344,7 +360,8 @@ impl<'a> NameReader<'a> {
     }
 
     pub fn lookup_symbol(&mut self, symbol: TokenPtr) -> Option<LookupSymbol> {
-        match self.nameset.symbols.get(symbol) {
+        let symbolt = ITokenRef::from(symbol);
+        match self.nameset.symbols.get(symbolt) {
             Some(&ref syminfo) => {
                 if self.incremental {
                     self.found_symbol.insert(syminfo.atom);
@@ -360,7 +377,7 @@ impl<'a> NameReader<'a> {
             }
             None => {
                 if self.incremental {
-                    self.not_found_symbol.insert(symbol.to_owned());
+                    self.not_found_symbol.insert(symbolt.to_owned());
                 }
                 None
             }
@@ -369,7 +386,8 @@ impl<'a> NameReader<'a> {
 
     // TODO: consider merging this with lookup_symbol
     pub fn lookup_float(&mut self, symbol: TokenPtr) -> Option<LookupFloat<'a>> {
-        match self.nameset.symbols.get(symbol) {
+        let symbolt = ITokenRef::from(symbol);
+        match self.nameset.symbols.get(symbolt) {
             Some(&ref syminfo) => {
                 if self.incremental {
                     self.found_symbol.insert(syminfo.atom);
@@ -385,7 +403,7 @@ impl<'a> NameReader<'a> {
             }
             None => {
                 if self.incremental {
-                    self.not_found_symbol.insert(symbol.to_owned());
+                    self.not_found_symbol.insert(symbolt.to_owned());
                 }
                 None
             }
@@ -419,7 +437,7 @@ impl NameUsage {
         }
 
         for &atom in &self.found_symbol {
-            match nameset.symbols.get(nameset.atom_name(atom)) {
+            match nameset.symbols.get(nameset.atom_name_itok(atom)) {
                 None => return false,
                 Some(infop) => {
                     if infop.generation > self.generation {
@@ -436,7 +454,7 @@ impl NameUsage {
         }
 
         for &atom in &self.found_label {
-            match nameset.labels.get(nameset.atom_name(atom)) {
+            match nameset.labels.get(nameset.atom_name_itok(atom)) {
                 None => return false,
                 Some(infop) => {
                     if infop.generation > self.generation {

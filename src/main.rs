@@ -19,6 +19,8 @@ mod database;
 mod diag;
 #[cfg(feature = "exotic_hash")]
 mod hash;
+#[cfg(feature = "exotic_hash")]
+mod itoken;
 mod nameck;
 mod parser;
 mod scopeck;

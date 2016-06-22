@@ -1,5 +1,7 @@
 use bit_set::Bitset;
 use diag::Diagnostic;
+use itoken::IToken;
+use itoken::ITokenRef;
 use nameck::Atom;
 use nameck::NameReader;
 use nameck::Nameset;
@@ -723,7 +725,7 @@ pub struct ScopeResult {
     incremental: bool,
     generation: usize,
     segments: Vec<Option<Arc<SegmentScopeResult>>>,
-    frame_index: HashMap<Token, (usize, usize, usize)>,
+    frame_index: HashMap<IToken, (usize, usize, usize)>,
 }
 
 impl ScopeResult {
@@ -807,8 +809,8 @@ pub fn scope_check(result: &mut ScopeResult, segments: &Arc<SegmentSet>, names: 
             id: stale_id,
         };
         for frame in &oseg.frames_out {
-            let label = sref.statement(frame.valid.start.index).label().to_owned();
-            let old = result.frame_index.remove(&label);
+            let label = ITokenRef::from(sref.statement(frame.valid.start.index).label());
+            let old = result.frame_index.remove(label);
             assert!(old.is_some(), "check_label_dup should prevent this");
         }
     }
@@ -821,7 +823,7 @@ pub fn scope_check(result: &mut ScopeResult, segments: &Arc<SegmentSet>, names: 
 
         let sref = segments.segment(res_new.id);
         for (index, frame) in res_new.frames_out.iter().enumerate() {
-            let label = sref.statement(frame.valid.start.index).label().to_owned();
+            let label = IToken::from_slice(sref.statement(frame.valid.start.index).label());
             let old = result.frame_index.insert(label, (gen, seg_index, index));
             assert!(old.is_none(), "check_label_dup should prevent this");
         }
@@ -834,7 +836,7 @@ pub struct ScopeReader<'a> {
     result: &'a ScopeResult,
     incremental: bool,
     found: HashSet<Atom>,
-    not_found: HashSet<Token>,
+    not_found: HashSet<IToken>,
 }
 
 impl<'a> ScopeReader<'a> {
@@ -857,10 +859,11 @@ impl<'a> ScopeReader<'a> {
     }
 
     pub fn get(&mut self, name: TokenPtr) -> Option<&'a Frame> {
-        match self.result.frame_index.get(name) {
+        let iname = ITokenRef::from(name);
+        match self.result.frame_index.get(iname) {
             None => {
                 if self.incremental {
-                    self.not_found.insert(name.to_owned());
+                    self.not_found.insert(iname.to_owned());
                 }
                 None
             }
@@ -879,7 +882,7 @@ pub struct ScopeUsage {
     generation: usize,
     incremental: bool,
     found: HashSet<Atom>,
-    not_found: HashSet<Token>,
+    not_found: HashSet<IToken>,
 }
 
 impl ScopeUsage {
@@ -889,7 +892,7 @@ impl ScopeUsage {
         }
 
         for &atom in &self.found {
-            match res.frame_index.get(name.atom_name(atom)) {
+            match res.frame_index.get(name.atom_name_itok(atom)) {
                 None => return false,
                 Some(&(gen, _segid, _frix)) => {
                     if gen > self.generation {
