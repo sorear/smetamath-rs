@@ -420,13 +420,10 @@ pub struct VerifyResult {
 
 impl VerifyResult {
     pub fn diagnostics(&self) -> Vec<(StatementAddress, Diagnostic)> {
-        let mut out = Vec::new();
-        for vsr in self.segments.values() {
-            for (&sa, &ref diag) in &vsr.diagnostics {
-                out.push((sa, diag.clone()));
-            }
-        }
-        out
+        self.segments
+            .values()
+            .flat_map(|vsr| vsr.diagnostics.iter().map(|(&sa, diag)| (sa, diag.clone())))
+            .collect()
     }
 }
 
@@ -453,9 +450,9 @@ fn verify_segment(sset: &SegmentSet,
         dv_map: &dummy_frame.optional_dv,
     };
     for stmt in sref.statement_iter() {
-        if let Err(diag) = verify_proof(&mut state, stmt) {
+        verify_proof(&mut state, stmt).unwrap_or_else(|diag| {
             diagnostics.insert(stmt.address(), diag);
-        }
+        })
     }
     VerifySegment {
         source: sref.segment.clone(),
