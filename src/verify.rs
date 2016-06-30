@@ -3,7 +3,7 @@ use diag::Diagnostic;
 use nameck::{Atom, Nameset};
 use parser::{self, Comparer, copy_token, NO_STATEMENT, Segment, SegmentId, SegmentOrder,
              SegmentRef, StatementAddress, StatementRef, StatementType, TokenPtr};
-use scopeck::{ExprFragment, Frame, Hyp, ScopeReader, ScopeResult, ScopeUsage, VerifyExpr};
+use scopeck::{self, ExprFragment, Frame, ScopeReader, ScopeResult, ScopeUsage, VerifyExpr};
 use segment_set::SegmentSet;
 use std::cmp::Ordering;
 use std::mem;
@@ -18,6 +18,7 @@ use util::fast_extend;
 use util::HashMap;
 use util::new_map;
 use util::ptr_eq;
+use self::PreparedStep::{Hyp, Assert};
 
 enum PreparedStep<'a> {
     Hyp(Bitset, Atom, Range<usize>),
@@ -54,7 +55,7 @@ fn map_var<'a>(state: &mut VerifyState<'a>, token: Atom) -> usize {
 
 impl<'a> VerifyState<'a> {
     // the initial hypotheses are accessed directly to avoid having to look up their names
-    fn prepare_hypothesis(&mut self, hyp: &'a Hyp) {
+    fn prepare_hypothesis(&mut self, hyp: &'a scopeck::Hyp) {
         let mut vars = Bitset::new();
         let tos = self.stack_buffer.len();
 
@@ -77,7 +78,7 @@ impl<'a> VerifyState<'a> {
         }
 
         let ntos = self.stack_buffer.len();
-        self.prepared.push(PreparedStep::Hyp(vars, hyp.expr.typecode, tos..ntos));
+        self.prepared.push(Hyp(vars, hyp.expr.typecode, tos..ntos));
     }
 
     /// Adds a named $e hypothesis to the prepared array.  These are not kept in the frame
@@ -114,7 +115,7 @@ impl<'a> VerifyState<'a> {
         }
 
         if frame.stype == StatementType::Axiom || frame.stype == StatementType::Provable {
-            self.prepared.push(PreparedStep::Assert(frame));
+            self.prepared.push(Assert(frame));
         } else {
             let mut vars = Bitset::new();
 
@@ -126,7 +127,7 @@ impl<'a> VerifyState<'a> {
             fast_extend(&mut self.stack_buffer, &frame.stub_expr);
             let ntos = self.stack_buffer.len();
             self.prepared
-                .push(PreparedStep::Hyp(vars, frame.target.typecode, tos..ntos));
+                .push(Hyp(vars, frame.target.typecode, tos..ntos));
         }
 
         return Ok(());
@@ -138,7 +139,7 @@ impl<'a> VerifyState<'a> {
         }
 
         let fref = match self.prepared[index] {
-            PreparedStep::Hyp(ref vars, code, ref expr) => {
+            Hyp(ref vars, code, ref expr) => {
                 self.stack.push(StackSlot {
                     vars: vars.clone(),
                     code: code,
@@ -146,7 +147,7 @@ impl<'a> VerifyState<'a> {
                 });
                 return Ok(());
             }
-            PreparedStep::Assert(fref) => fref,
+            Assert(fref) => fref,
         };
 
         if self.stack.len() < fref.hypotheses.len() {
@@ -177,14 +178,12 @@ impl<'a> VerifyState<'a> {
 
             if hyp.is_float() {
                 self.subst_info[hyp.variable_index] = (slot.expr.clone(), slot.vars.clone());
-            } else {
-                if !do_substitute_eq(&self.stack_buffer[slot.expr.clone()],
-                                     fref,
-                                     &hyp.expr,
-                                     &self.subst_info,
-                                     &self.stack_buffer) {
-                    return Err(Diagnostic::StepEssenWrong);
-                }
+            } else if !do_substitute_eq(&self.stack_buffer[slot.expr.clone()],
+                                 fref,
+                                 &hyp.expr,
+                                 &self.subst_info,
+                                 &self.stack_buffer) {
+                return Err(Diagnostic::StepEssenWrong);
             }
         }
 
@@ -238,7 +237,7 @@ impl<'a> VerifyState<'a> {
 
     fn save_step(&mut self) {
         let top = self.stack.last().expect("can_save should prevent getting here");
-        self.prepared.push(PreparedStep::Hyp(top.vars.clone(), top.code, top.expr.clone()));
+        self.prepared.push(Hyp(top.vars.clone(), top.code, top.expr.clone()));
     }
 
     // proofs are not self-synchronizing, so it's not likely to get >1 usable error
