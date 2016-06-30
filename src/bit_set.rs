@@ -15,7 +15,7 @@ use std::slice;
 #[derive(Default,Debug)]
 pub struct Bitset {
     head: usize,
-    tail: Option<Vec<usize>>,
+    tail: Option<Box<Vec<usize>>>,
 }
 
 fn bits_per_word() -> usize {
@@ -54,7 +54,7 @@ impl Bitset {
 
     fn tail_mut(&mut self) -> &mut Vec<usize> {
         if self.tail.is_none() {
-            self.tail = Some(Vec::new());
+            self.tail = Some(Box::new(Vec::new()));
         }
         self.tail.as_mut().unwrap()
     }
