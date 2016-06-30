@@ -11,7 +11,6 @@ use segment_set::SourceInfo;
 use std::fmt::Display;
 use std::mem;
 use std::sync::Arc;
-use std::result;
 
 /// List of passes that generate diagnostics, for use with the
 /// `Database::diag_notations` filter.
@@ -95,8 +94,6 @@ pub enum Diagnostic {
     VariableMissingFloat(TokenIndex),
     VariableRedeclaredAsConstant(TokenIndex, TokenAddress),
 }
-
-pub type Result<T> = result::Result<T, Diagnostic>;
 
 /// An indication of the severity of a notation.
 #[derive(Copy,Clone,Debug)]

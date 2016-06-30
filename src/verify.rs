@@ -1,5 +1,5 @@
 use bit_set::Bitset;
-use diag::{Diagnostic, Result};
+use diag::Diagnostic;
 use nameck::{Atom, Nameset};
 use parser::{self, Comparer, copy_token, NO_STATEMENT, Segment, SegmentId, SegmentOrder,
              SegmentRef, StatementAddress, StatementRef, StatementType, TokenPtr};
@@ -8,6 +8,7 @@ use segment_set::SegmentSet;
 use std::cmp::Ordering;
 use std::mem;
 use std::ops::Range;
+use std::result;
 use std::sync::Arc;
 use std::u32;
 use std::usize;
@@ -44,6 +45,8 @@ struct VerifyState<'a> {
     dv_map: &'a [Bitset],
 }
 
+type Result = result::Result<(), Diagnostic>;
+
 fn map_var<'a>(state: &mut VerifyState<'a>, token: Atom) -> usize {
     let nbit = state.var2bit.len();
     *state.var2bit.entry(token).or_insert(nbit)
@@ -78,7 +81,7 @@ fn prepare_hypothesis<'a>(state: &mut VerifyState, hyp: &'a Hyp) {
 
 /// Adds a named $e hypothesis to the prepared array.  These are not kept in the frame
 /// array due to infrequent use, so other measures are needed.
-fn prepare_named_hyp(state: &mut VerifyState, label: TokenPtr) -> Result<()> {
+fn prepare_named_hyp(state: &mut VerifyState, label: TokenPtr) -> Result {
     for hyp in &*state.cur_frame.hypotheses {
         if hyp.is_float() {
             continue;
@@ -92,7 +95,7 @@ fn prepare_named_hyp(state: &mut VerifyState, label: TokenPtr) -> Result<()> {
     return Err(Diagnostic::StepMissing(copy_token(label)));
 }
 
-fn prepare_step(state: &mut VerifyState, label: TokenPtr) -> Result<()> {
+fn prepare_step(state: &mut VerifyState, label: TokenPtr) -> Result {
     let frame = match state.scoper.get(label) {
         Some(fp) => fp,
         None => {
@@ -193,7 +196,7 @@ fn do_substitute_vars(expr: &[ExprFragment], vars: &[(Range<usize>, Bitset)]) ->
     out
 }
 
-fn execute_step(state: &mut VerifyState, index: usize) -> Result<()> {
+fn execute_step(state: &mut VerifyState, index: usize) -> Result {
     if index >= state.prepared.len() {
         return Err(Diagnostic::StepOutOfRange);
     }
@@ -277,7 +280,7 @@ fn execute_step(state: &mut VerifyState, index: usize) -> Result<()> {
     return Ok(());
 }
 
-fn finalize_step(state: &mut VerifyState) -> Result<()> {
+fn finalize_step(state: &mut VerifyState) -> Result {
     if state.stack.len() == 0 {
         return Err(Diagnostic::ProofNoSteps);
     }
@@ -306,7 +309,7 @@ fn save_step(state: &mut VerifyState) {
 }
 
 // proofs are not self-synchronizing, so it's not likely to get >1 usable error
-fn verify_proof<'a>(state: &mut VerifyState<'a>, stmt: StatementRef<'a>) -> Result<()> {
+fn verify_proof<'a>(state: &mut VerifyState<'a>, stmt: StatementRef<'a>) -> Result {
     // only intend to check $p statements
     if stmt.statement.stype != StatementType::Provable {
         return Ok(());
@@ -450,9 +453,9 @@ fn verify_segment(sset: &SegmentSet,
         dv_map: &dummy_frame.optional_dv,
     };
     for stmt in sref.statement_iter() {
-        verify_proof(&mut state, stmt).unwrap_or_else(|diag| {
+        if let Err(diag) = verify_proof(&mut state, stmt) {
             diagnostics.insert(stmt.address(), diag);
-        })
+        }
     }
     VerifySegment {
         source: sref.segment.clone(),

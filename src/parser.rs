@@ -765,11 +765,11 @@ impl<'a> Scanner<'a> {
             if lref.contains(&b'$') {
                 self.unget = ltok;
                 break;
-            } else if is_valid_label(lref) {
-                self.labels.push(ltok);
-            } else {
+            } else if !is_valid_label(lref) {
                 self.diag(Diagnostic::BadLabel(ltok));
                 self.has_bad_labels = true;
+            } else {
+                self.labels.push(ltok);
             }
         }
     }
