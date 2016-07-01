@@ -294,13 +294,13 @@ impl SegmentSet {
 
         // LCS lite
         while old_r.start < old_r.end && new_r.start < new_r.end &&
-              ptr_eq::<Segment>(&(old_segs[old_r.start].1).0, &new_segs[new_r.start].0) {
+              ptr_eq(&(old_segs[old_r.start].1).0, &new_segs[new_r.start].0) {
             old_r.start += 1;
             new_r.start += 1;
         }
 
         while old_r.start < old_r.end && new_r.start < new_r.end &&
-              ptr_eq::<Segment>(&(old_segs[old_r.end - 1].1).0, &new_segs[new_r.end - 1].0) {
+              ptr_eq(&(old_segs[old_r.end - 1].1).0, &new_segs[new_r.end - 1].0) {
             old_r.end -= 1;
             new_r.end -= 1;
         }

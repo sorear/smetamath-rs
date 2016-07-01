@@ -216,10 +216,8 @@ impl<'a> VerifyState<'a> {
         // check $d
         for &(ix1, ix2) in &*fref.mandatory_dv {
             for var1 in &self.subst_info[ix1].1 {
-                for var2 in &self.subst_info[ix2].1 {
-                    try_assert!(var1 < self.dv_map.len() && self.dv_map[var1].has_bit(var2),
-                                Diagnostic::ProofDvViolation);
-                }
+                try_assert!(self.subst_info[ix2].1.le_opt(self.dv_map.get(var1)),
+                            Diagnostic::ProofDvViolation);
             }
         }
 

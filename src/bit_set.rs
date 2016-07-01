@@ -8,11 +8,13 @@
 //! exercised at all without special measures.)
 
 use std::ops::BitOrAssign;
+use std::cmp::PartialOrd;
+use std::cmp::Ordering;
 use std::slice;
 
 
 /// A set of variable indices.
-#[derive(Default,Debug)]
+#[derive(Default,Debug,PartialEq,Eq)]
 pub struct Bitset {
     head: usize,
     tail: Option<Box<Vec<usize>>>,
@@ -105,13 +107,22 @@ impl Bitset {
             old
         }
     }
+
+    /// same as `self <= rhs`, but with `rhs` treated as zero if empty
+    #[inline]
+    pub fn le_opt(&self, rhs: Option<&Bitset>) -> bool {
+        match rhs {
+            None => *self == Bitset::new(),
+            Some(&ref rhs) => *self <= *rhs,
+        }
+    }
+    
 }
 
 impl<'a> BitOrAssign<&'a Bitset> for Bitset {
     fn bitor_assign(&mut self, rhs: &'a Bitset) {
         self.head |= rhs.head;
-        let rtail = rhs.tail();
-        if !rtail.is_empty() {
+        if let Some(ref rtail) = rhs.tail {
             let stail = self.tail_mut();
             if rtail.len() > stail.len() {
                 stail.resize(rtail.len(), 0);
@@ -119,6 +130,42 @@ impl<'a> BitOrAssign<&'a Bitset> for Bitset {
             for i in 0..rtail.len() {
                 stail[i] |= rtail[i];
             }
+        }
+    }
+}
+
+impl<'a> PartialOrd<Bitset> for Bitset {
+    /// The powerset partial ordering of bit sets: a bit set `L` is less or equal to `R`
+    /// if every bit which is set in `L` is also set in `R`. 
+    fn le(&self, rhs: &Bitset) -> bool {
+        match self.tail {
+            None => self.head | rhs.head == rhs.head,
+            Some(ref stail) => {
+                let rtail = rhs.tail();
+                stail.len() <= rtail.len() && (self.head | rhs.head == rhs.head) &&
+                (0..stail.len()).all(|i| stail[i] | rtail[i] == rtail[i])
+            }
+        }
+    }
+    
+    fn ge(&self, rhs: &Bitset) -> bool {
+        rhs <= self
+    }
+
+    fn lt(&self, rhs: &Bitset) -> bool {
+        self <= rhs && self != rhs
+    }
+    
+    fn gt(&self, rhs: &Bitset) -> bool {
+        rhs < self
+    }
+
+    fn partial_cmp(&self, rhs: &Bitset) -> Option<Ordering> {
+        match (self <= rhs, rhs <= self) {
+            (true, true) => Some(Ordering::Equal),
+            (true, false) => Some(Ordering::Less),
+            (false, true) => Some(Ordering::Greater),
+            (false, false) => None,
         }
     }
 }
