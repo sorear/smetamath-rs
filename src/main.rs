@@ -11,6 +11,15 @@ extern crate fnv;
 #[cfg(feature = "sysalloc")]
 extern crate alloc_system;
 
+#[macro_export]
+macro_rules! try_assert {
+    ( $cond:expr , $($arg:tt)+ ) => {
+        if !$cond {
+            try!(Err($($arg)+))
+        }
+    }
+}
+
 pub mod bit_set;
 pub mod database;
 pub mod diag;

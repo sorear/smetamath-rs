@@ -64,14 +64,14 @@ struct VerifyState<'a> {
     dv_map: &'a [Bitset],
 }
 
-type Result = result::Result<(), Diagnostic>;
-
-fn map_var<'a>(state: &mut VerifyState<'a>, token: Atom) -> usize {
-    let nbit = state.var2bit.len();
-    *state.var2bit.entry(token).or_insert(nbit)
-}
+type Result<T> = result::Result<T, Diagnostic>;
 
 impl<'a> VerifyState<'a> {
+    fn map_var(&mut self, token: Atom) -> usize {
+        let nbit = self.var2bit.len();
+        *self.var2bit.entry(token).or_insert(nbit)
+    }
+
     // the initial hypotheses are accessed directly to avoid having to look up their names
     fn prepare_hypothesis(&mut self, hyp: &'a scopeck::Hyp) {
         let mut vars = Bitset::new();
@@ -101,7 +101,7 @@ impl<'a> VerifyState<'a> {
 
     /// Adds a named $e hypothesis to the prepared array.  These are not kept in the frame
     /// array due to infrequent use, so other measures are needed.
-    fn prepare_named_hyp(&mut self, label: TokenPtr) -> Result {
+    fn prepare_named_hyp(&mut self, label: TokenPtr) -> Result<()> {
         for hyp in &*self.cur_frame.hypotheses {
             if hyp.is_float() {
                 continue;
@@ -115,7 +115,7 @@ impl<'a> VerifyState<'a> {
         return Err(Diagnostic::StepMissing(copy_token(label)));
     }
 
-    fn prepare_step(&mut self, label: TokenPtr) -> Result {
+    fn prepare_step(&mut self, label: TokenPtr) -> Result<()> {
         let frame = match self.scoper.get(label) {
             Some(fp) => fp,
             None => return self.prepare_named_hyp(label),
@@ -123,14 +123,12 @@ impl<'a> VerifyState<'a> {
 
         let valid = frame.valid;
         let pos = self.cur_frame.valid.start;
-        if self.order.cmp(&pos, &valid.start) != Ordering::Greater {
-            return Err(Diagnostic::StepUsedBeforeDefinition(copy_token(label)));
-        }
+        try_assert!(self.order.cmp(&pos, &valid.start) == Ordering::Greater,
+                    Diagnostic::StepUsedBeforeDefinition(copy_token(label)));
 
-        if valid.end != NO_STATEMENT &&
-           (pos.segment_id != valid.start.segment_id || pos.index >= valid.end) {
-            return Err(Diagnostic::StepUsedAfterScope(copy_token(label)));
-        }
+        try_assert!(valid.end == NO_STATEMENT ||
+                    pos.segment_id == valid.start.segment_id && pos.index < valid.end,
+                    Diagnostic::StepUsedAfterScope(copy_token(label)));
 
         if frame.stype == StatementType::Axiom || frame.stype == StatementType::Provable {
             self.prepared.push(Assert(frame));
@@ -138,7 +136,7 @@ impl<'a> VerifyState<'a> {
             let mut vars = Bitset::new();
 
             for &var in &*frame.var_list {
-                vars.set_bit(map_var(self, var));
+                vars.set_bit(self.map_var(var));
             }
 
             let tos = self.stack_buffer.len();
@@ -151,10 +149,8 @@ impl<'a> VerifyState<'a> {
         return Ok(());
     }
 
-    fn execute_step(&mut self, index: usize) -> Result {
-        if index >= self.prepared.len() {
-            return Err(Diagnostic::StepOutOfRange);
-        }
+    fn execute_step(&mut self, index: usize) -> Result<()> {
+        try_assert!(index < self.prepared.len(), Diagnostic::StepOutOfRange);
 
         let fref = match self.prepared[index] {
             Hyp(ref vars, code, ref expr) => {
@@ -168,10 +164,10 @@ impl<'a> VerifyState<'a> {
             Assert(fref) => fref,
         };
 
-        if self.stack.len() < fref.hypotheses.len() {
-            return Err(Diagnostic::ProofUnderflow);
-        }
-        let sbase = self.stack.len() - fref.hypotheses.len();
+        let sbase = try!(self.stack
+            .len()
+            .checked_sub(fref.hypotheses.len())
+            .ok_or(Diagnostic::ProofUnderflow));
 
         while self.subst_info.len() < fref.mandatory_count {
             // this is mildly unhygenic, since slots corresponding to $e hyps won't get cleared, but
@@ -186,22 +182,22 @@ impl<'a> VerifyState<'a> {
             let slot = &self.stack[sbase + ix];
 
             // schedule a memory ref and nice predicable branch before the ugly branch
-            if slot.code != hyp.expr.typecode {
-                return Err(if hyp.is_float() {
-                    Diagnostic::StepFloatWrongType
-                } else {
-                    Diagnostic::StepEssenWrongType
-                });
-            }
+            try_assert!(slot.code == hyp.expr.typecode,
+                        if hyp.is_float() {
+                            Diagnostic::StepFloatWrongType
+                        } else {
+                            Diagnostic::StepEssenWrongType
+                        });
 
             if hyp.is_float() {
                 self.subst_info[hyp.variable_index] = (slot.expr.clone(), slot.vars.clone());
-            } else if !do_substitute_eq(&self.stack_buffer[slot.expr.clone()],
-                                 fref,
-                                 &hyp.expr,
-                                 &self.subst_info,
-                                 &self.stack_buffer) {
-                return Err(Diagnostic::StepEssenWrong);
+            } else {
+                try_assert!(do_substitute_eq(&self.stack_buffer[slot.expr.clone()],
+                                             fref,
+                                             &hyp.expr,
+                                             &self.subst_info,
+                                             &self.stack_buffer),
+                            Diagnostic::StepEssenWrong);
             }
         }
 
@@ -220,9 +216,8 @@ impl<'a> VerifyState<'a> {
         for &(ix1, ix2) in &*fref.mandatory_dv {
             for var1 in &self.subst_info[ix1].1 {
                 for var2 in &self.subst_info[ix2].1 {
-                    if var1 >= self.dv_map.len() || !self.dv_map[var1].has_bit(var2) {
-                        return Err(Diagnostic::ProofDvViolation);
-                    }
+                    try_assert!(var1 < self.dv_map.len() && self.dv_map[var1].has_bit(var2),
+                                Diagnostic::ProofDvViolation);
                 }
             }
         }
@@ -230,25 +225,18 @@ impl<'a> VerifyState<'a> {
         return Ok(());
     }
 
-    fn finalize_step(&mut self) -> Result {
-        if self.stack.len() == 0 {
-            return Err(Diagnostic::ProofNoSteps);
-        }
-        if self.stack.len() > 1 {
-            return Err(Diagnostic::ProofExcessEnd);
-        }
-        let tos = self.stack.last().unwrap();
+    fn finalize_step(&mut self) -> Result<()> {
+        try_assert!(self.stack.len() <= 1, Diagnostic::ProofExcessEnd);
+        let tos = try!(self.stack.last().ok_or(Diagnostic::ProofNoSteps));
 
-        if tos.code != self.cur_frame.target.typecode {
-            return Err(Diagnostic::ProofWrongTypeEnd);
-        }
+        try_assert!(tos.code == self.cur_frame.target.typecode,
+                    Diagnostic::ProofWrongTypeEnd);
 
         fast_clear(&mut self.temp_buffer);
         do_substitute_raw(&mut self.temp_buffer, &self.cur_frame, self.nameset);
 
-        if self.stack_buffer[tos.expr.clone()] != self.temp_buffer[..] {
-            return Err(Diagnostic::ProofWrongExprEnd);
-        }
+        try_assert!(self.stack_buffer[tos.expr.clone()] == self.temp_buffer[..],
+                    Diagnostic::ProofWrongExprEnd);
 
         Ok(())
     }
@@ -259,7 +247,7 @@ impl<'a> VerifyState<'a> {
     }
 
     // proofs are not self-synchronizing, so it's not likely to get >1 usable error
-    fn verify_proof(&mut self, stmt: StatementRef<'a>) -> Result {
+    fn verify_proof(&mut self, stmt: StatementRef<'a>) -> Result<()> {
         // only intend to check $p selfments
         if stmt.statement.stype != StatementType::Provable {
             return Ok(());
@@ -292,9 +280,8 @@ impl<'a> VerifyState<'a> {
             }
 
             loop {
-                if i >= stmt.proof_len() {
-                    return Err(Diagnostic::ProofUnterminatedRoster);
-                }
+                try_assert!(i < stmt.proof_len(), Diagnostic::ProofUnterminatedRoster);
+
                 let chunk = stmt.proof_slice_at(i);
                 i += 1;
 
@@ -317,40 +304,30 @@ impl<'a> VerifyState<'a> {
                         can_save = true;
                     } else if ch >= b'U' && ch <= b'Y' {
                         k = k * 5 + 1 + (ch - b'U') as usize;
-                        if k >= (u32::max_value() as usize / 20) - 1 {
-                            return Err(Diagnostic::ProofMalformedVarint);
-                        }
+                        try_assert!(k < (u32::max_value() as usize / 20) - 1,
+                                    Diagnostic::ProofMalformedVarint);
                         can_save = false;
                     } else if ch == b'Z' {
-                        if !can_save {
-                            return Err(Diagnostic::ProofInvalidSave);
-                        }
+                        try_assert!(can_save, Diagnostic::ProofInvalidSave);
                         self.save_step();
                         can_save = false;
                     } else if ch == b'?' {
-                        if k > 0 {
-                            return Err(Diagnostic::ProofMalformedVarint);
-                        }
+                        try_assert!(k == 0, Diagnostic::ProofMalformedVarint);
                         return Err(Diagnostic::ProofIncomplete);
                     }
                 }
                 i += 1;
             }
 
-            if k > 0 {
-                return Err(Diagnostic::ProofMalformedVarint);
-            }
+            try_assert!(k == 0, Diagnostic::ProofMalformedVarint);
         } else {
             let mut count = 0;
             for i in 0..stmt.proof_len() {
                 let chunk = stmt.proof_slice_at(i);
-                if chunk == b"?" {
-                    return Err(Diagnostic::ProofIncomplete);
-                } else {
-                    try!(self.prepare_step(chunk));
-                    try!(self.execute_step(count));
-                    count += 1;
-                }
+                try_assert!(chunk != b"?", Diagnostic::ProofIncomplete);
+                try!(self.prepare_step(chunk));
+                try!(self.execute_step(count));
+                count += 1;
             }
         }
 

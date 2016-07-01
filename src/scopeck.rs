@@ -212,9 +212,7 @@ impl<'a> ScopeState<'a> {
         None
     }
 
-    fn check_eap(&mut self,
-                 sref: StatementRef<'a>)
-                 -> Option<Vec<CheckedToken<'a>>> {
+    fn check_eap(&mut self, sref: StatementRef<'a>) -> Option<Vec<CheckedToken<'a>>> {
         // does the math string consist of active tokens, where the first is a constant
         // and all variables have typecodes in scope?
         let mut bad = false;
@@ -365,8 +363,7 @@ impl InchoateFrame {
 
         for (leftpos, &leftid) in var_ids.iter().enumerate() {
             for &rightid in &var_ids[leftpos + 1..] {
-                if !self.optional_dv[leftid].has_bit(rightid) {
-                    self.optional_dv[leftid].set_bit(rightid);
+                if !self.optional_dv[leftid].set_bit_if(rightid) {
                     self.optional_dv[rightid].set_bit(leftid);
                     if leftid < self.mandatory_count && rightid < self.mandatory_count {
                         self.mandatory_dv.push((leftid, rightid));
@@ -521,16 +518,14 @@ impl<'a> ScopeState<'a> {
     }
 
     fn scope_check_essential(&mut self, sref: StatementRef<'a>) {
-        let latom = self.check_label_dup(sref);
-        if latom.is_none() {
-            return;
-        }
-        if let Some(expr) = self.check_eap(sref) {
-            self.local_essen.push(LocalEssentialInfo {
-                valid: sref.scope_range(),
-                label: sref.label(),
-                string: expr,
-            });
+        if self.check_label_dup(sref).is_some() {
+            if let Some(expr) = self.check_eap(sref) {
+                self.local_essen.push(LocalEssentialInfo {
+                    valid: sref.scope_range(),
+                    label: sref.label(),
+                    string: expr,
+                });
+            }
         }
     }
 
