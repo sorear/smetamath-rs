@@ -1,3 +1,22 @@
+//! This module calculates 3 things which are related only by the fact that they can be done
+//! at the same time:
+//!
+//! 1. For $c $v $f and labelled statements ($e $f $a $p): Check for duplication
+//!
+//! 2. For $e $d $f $a $p: Check that all used math symbols are active in scope
+//!
+//! 3. For $a $p: Compute the frame
+//!
+//! Rules of precedence for error detection and recovery:
+//!
+//! 1. Math symbols and labels are actually in separate namespaces.  We warn about collisions but
+//! otherwise do nothing.  Variables have responsibility for the warning.
+//!
+//! 2. When two definitions have overlapping live ranges, the earlier one wins.
+//!
+//! 3. Constant/nested variable collisions are special because they don't involve scope overlaps.
+//! The constant wins, the variable must notify.
+
 use bit_set::Bitset;
 use diag::Diagnostic;
 use nameck::Atom;
@@ -33,25 +52,6 @@ use util::HashSet;
 use util::new_map;
 use util::new_set;
 use util::ptr_eq;
-
-// This module calculates 3 things which are related only by the fact that they can be done
-// at the same time:
-//
-// 1. For $c $v $f and labelled statements ($e $f $a $p): Check for duplication
-//
-// 2. For $e $d $f $a $p: Check that all used math symbols are active in scope
-//
-// 3. For $a $p: Compute the frame
-
-// Rules of precedence for error detection and recovery:
-//
-// 1. Math symbols and labels are actually in separate namespaces.  We warn about collisions but
-// otherwise do nothing.  Variables have responsibility for the warning.
-//
-// 2. When two definitions have overlapping live ranges, the earlier one wins.
-//
-// 3. Constant/nested variable collisions are special because they don't involve scope overlaps.
-// The constant wins, the variable must notify.
 
 #[derive(Clone,Copy)]
 struct LocalVarInfo {
@@ -119,7 +119,7 @@ pub struct Hyp {
 
 impl Hyp {
     pub fn is_float(&self) -> bool {
-        0 != !self.variable_index
+        self.variable_index != !0
     }
 }
 
@@ -166,7 +166,7 @@ impl<'a> ScopeState<'a> {
             }
             return Some(def.atom);
         }
-        None // should be unreachable?
+        unreachable!()
     }
 
     fn check_math_symbol(&mut self,
@@ -203,9 +203,9 @@ impl<'a> ScopeState<'a> {
         }
 
         // active local definition?
-        if let Some(local_slot) = self.local_floats.get(tref.slice).and_then(|slot| slot.last()) {
+        if let Some(&local_slot) = self.local_floats.get(tref.slice).and_then(|slot| slot.last()) {
             if check_endpoint(sref.index, local_slot.valid.end) {
-                return Some(*local_slot);
+                return Some(local_slot);
             }
         }
 
@@ -222,9 +222,7 @@ impl<'a> ScopeState<'a> {
 
         for tref in sref.math_iter() {
             match self.check_math_symbol(sref, tref) {
-                None => {
-                    bad = true;
-                }
+                None => bad = true,
                 Some((SymbolType::Constant, atom)) => {
                     out.push(CheckedToken::Const(tref.slice, atom));
                 }
@@ -316,23 +314,20 @@ impl InchoateFrame {
         let mut open_const = self.const_pool.len();
         let mut tail = Vec::with_capacity(expr.len());
 
-        while let Some(ctok) = iter.next() {
-            match *ctok {
+        for &ctok in iter {
+            match ctok {
                 CheckedToken::Const(tref, _) => {
                     fast_extend(&mut self.const_pool, tref);
                     *self.const_pool.last_mut().unwrap() |= 0x80;
                 }
                 CheckedToken::Var(_, atom, lfi) => {
-                    let index = match self.variables.get(&atom).map(|&(x, _)| x) {
-                        Some(mvarindex) => mvarindex,
-                        None => {
-                            let index = self.variables.len();
-                            self.var_list.push(atom);
-                            self.optional_dv.push(Bitset::new());
-                            self.variables.insert(atom, (index, lfi));
-                            index
-                        }
-                    };
+                    let index = self.variables.get(&atom).map(|&(x, _)| x).unwrap_or_else(|| {
+                        let index = self.variables.len();
+                        self.var_list.push(atom);
+                        self.optional_dv.push(Bitset::new());
+                        self.variables.insert(atom, (index, lfi));
+                        index
+                    });
                     tail.push(ExprFragment {
                         prefix: open_const..self.const_pool.len(),
                         var: index,
@@ -429,11 +424,11 @@ impl<'a> ScopeState<'a> {
         hyps.sort_by(|h1, h2| self.order.cmp(&h1.address, &h2.address));
         iframe.mandatory_count = iframe.var_list.len();
 
-        for &ref dv in &self.gnames.lookup_global_dv() {
+        for dv in self.gnames.lookup_global_dv() {
             iframe.scan_dv(&dv.vars)
         }
 
-        for &ref dv in &self.local_dv {
+        for dv in &self.local_dv {
             iframe.scan_dv(&dv.vars);
         }
 
@@ -453,13 +448,10 @@ impl<'a> ScopeState<'a> {
     }
 
     fn scope_check_axiom(&mut self, sref: StatementRef<'a>) {
-        let latom = self.check_label_dup(sref);
-        if latom.is_none() {
-            return;
-        }
-
-        if let Some(expr) = self.check_eap(sref) {
-            self.construct_full_frame(sref, latom.unwrap(), &expr);
+        if let Some(latom) = self.check_label_dup(sref) {
+            if let Some(expr) = self.check_eap(sref) {
+                self.construct_full_frame(sref, latom, &expr);
+            }
         }
     }
 
@@ -548,16 +540,14 @@ impl<'a> ScopeState<'a> {
         let const_tok = sref.math_at(0);
         let var_tok = sref.math_at(1);
 
-        let latom = self.check_label_dup(sref);
-        if latom.is_none() {
-            return;
-        }
+        let latom = match self.check_label_dup(sref) {
+            None => return,
+            Some(a) => a,
+        };
 
         let mut const_at = Atom::default();
         match self.check_math_symbol(sref, const_tok) {
-            None => {
-                bad = true;
-            }
+            None => bad = true,
             Some((SymbolType::Constant, atom)) => const_at = atom,
             Some((SymbolType::Variable, _)) => {
                 self.push_diagnostic(sref.index, Diagnostic::FloatNotConstant(0));
@@ -567,9 +557,7 @@ impl<'a> ScopeState<'a> {
 
         let mut var_at = Atom::default();
         match self.check_math_symbol(sref, var_tok) {
-            None => {
-                bad = true;
-            }
+            None => bad = true,
             Some((SymbolType::Variable, atom)) => var_at = atom,
             _ => {
                 self.push_diagnostic(sref.index, Diagnostic::FloatNotVariable(1));
@@ -599,7 +587,7 @@ impl<'a> ScopeState<'a> {
 
         let expr = [CheckedToken::Const(const_tok.slice, const_at),
                     CheckedToken::Var(var_tok.slice, var_at, LocalFloatInfo::default())];
-        self.construct_stub_frame(sref, latom.unwrap(), &expr);
+        self.construct_stub_frame(sref, latom, &expr);
     }
 }
 
@@ -630,12 +618,10 @@ impl<'a> ScopeState<'a> {
     }
 
     fn scope_check_provable(&mut self, sref: StatementRef<'a>) {
-        let latom = self.check_label_dup(sref);
-        if latom.is_none() {
-            return;
-        }
-        if let Some(expr) = self.check_eap(sref) {
-            self.construct_full_frame(sref, latom.unwrap(), &expr);
+        if let Some(latom) = self.check_label_dup(sref) {
+            if let Some(expr) = self.check_eap(sref) {
+                self.construct_full_frame(sref, latom, &expr);
+            }
         }
     }
 
@@ -740,10 +726,10 @@ pub struct ScopeResult {
 impl ScopeResult {
     pub fn diagnostics(&self) -> Vec<(StatementAddress, Diagnostic)> {
         let mut out = Vec::new();
-        for (sid, &ref ssro) in self.segments.iter().enumerate() {
-            if let Some(ref ssr) = *ssro {
-                for (&six, &ref diag) in &ssr.diagnostics {
-                    for &ref d in diag {
+        for (sid, ssro) in self.segments.iter().enumerate() {
+            if let &Some(ref ssr) = ssro {
+                for (&six, diag) in &ssr.diagnostics {
+                    for d in diag {
                         out.push((StatementAddress::new(SegmentId(sid as u32), six), d.clone()));
                     }
                 }
@@ -754,12 +740,8 @@ impl ScopeResult {
 }
 
 pub fn scope_check(result: &mut ScopeResult, segments: &Arc<SegmentSet>, names: &Arc<Nameset>) {
-    if result.frame_index.is_empty() {
-        result.incremental = true;
-    }
-    if !segments.options.incremental {
-        result.incremental = false;
-    }
+    result.incremental |= result.frame_index.is_empty();
+    result.incremental &= segments.options.incremental;
     result.generation += 1;
     let gen = result.generation;
     let mut ssrq = VecDeque::new();
@@ -777,8 +759,7 @@ pub fn scope_check(result: &mut ScopeResult, segments: &Arc<SegmentSet>, names: 
             ssrq.push_back(segments.exec.exec(sref.bytes(), move || {
                 let sref = segments2.segment(id);
                 if let Some(old_res) = osr {
-                    if old_res.name_usage.valid(&names) &&
-                       ptr_eq::<Segment>(&old_res.source, sref.segment) {
+                    if old_res.name_usage.valid(&names) && ptr_eq(&old_res.source, sref.segment) {
                         return None;
                     }
                 }
@@ -794,7 +775,7 @@ pub fn scope_check(result: &mut ScopeResult, segments: &Arc<SegmentSet>, names: 
     let mut stale_ids = new_set();
     let mut to_add = Vec::new();
 
-    for (sid, &ref res) in result.segments.iter().enumerate() {
+    for (sid, res) in result.segments.iter().enumerate() {
         if res.is_some() {
             stale_ids.insert(SegmentId(sid as u32));
         }
@@ -819,8 +800,7 @@ pub fn scope_check(result: &mut ScopeResult, segments: &Arc<SegmentSet>, names: 
         };
         for frame in &oseg.frames_out {
             let label = sref.statement(frame.valid.start.index).label();
-            let old = result.frame_index.remove(label);
-            assert!(old.is_some(), "check_label_dup should prevent this");
+            result.frame_index.remove(label).expect("check_label_dup should prevent this");
         }
     }
 
@@ -849,7 +829,7 @@ pub struct ScopeReader<'a> {
 }
 
 impl<'a> ScopeReader<'a> {
-    pub fn new(res: &'a ScopeResult) -> ScopeReader<'a> {
+    pub fn new(res: &ScopeResult) -> ScopeReader {
         ScopeReader {
             result: res,
             incremental: res.incremental,
@@ -895,27 +875,10 @@ pub struct ScopeUsage {
 
 impl ScopeUsage {
     pub fn valid(&self, name: &Nameset, res: &ScopeResult) -> bool {
-        if !self.incremental && res.generation > self.generation {
-            return false;
-        }
-
-        for &atom in &self.found {
-            match res.frame_index.get(name.atom_name(atom)) {
-                None => return false,
-                Some(&(gen, _segid, _frix)) => {
-                    if gen > self.generation {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        for &ref name in &self.not_found {
-            if res.frame_index.contains_key(name) {
-                return false;
-            }
-        }
-
-        return true;
+        (self.incremental || res.generation <= self.generation) &&
+        self.found.iter().all(|&atom| match res.frame_index.get(name.atom_name(atom)) {
+            None => false,
+            Some(&(gen, _segid, _frix)) => gen <= self.generation,
+        }) && self.not_found.iter().all(|name| !res.frame_index.contains_key(name))
     }
 }

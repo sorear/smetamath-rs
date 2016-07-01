@@ -5,6 +5,7 @@ use parser::{self, Comparer, copy_token, NO_STATEMENT, Segment, SegmentId, Segme
              SegmentRef, StatementAddress, StatementRef, StatementType, TokenPtr};
 use scopeck::{self, ExprFragment, Frame, ScopeReader, ScopeResult, ScopeUsage, VerifyExpr};
 use segment_set::SegmentSet;
+use self::PreparedStep::{Hyp, Assert};
 use std::cmp::Ordering;
 use std::mem;
 use std::ops::Range;
@@ -18,7 +19,6 @@ use util::fast_extend;
 use util::HashMap;
 use util::new_map;
 use util::ptr_eq;
-use self::PreparedStep::{Hyp, Assert};
 
 enum PreparedStep<'a> {
     Hyp(Bitset, Atom, Range<usize>),
