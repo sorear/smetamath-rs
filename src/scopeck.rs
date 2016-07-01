@@ -1,3 +1,22 @@
+//! This module calculates 3 things which are related only by the fact that they can be done
+//! at the same time:
+//!
+//! 1. For $c $v $f and labelled statements ($e $f $a $p): Check for duplication
+//!
+//! 2. For $e $d $f $a $p: Check that all used math symbols are active in scope
+//!
+//! 3. For $a $p: Compute the frame
+//!
+//! Rules of precedence for error detection and recovery:
+//!
+//! 1. Math symbols and labels are actually in separate namespaces.  We warn about collisions but
+//! otherwise do nothing.  Variables have responsibility for the warning.
+//!
+//! 2. When two definitions have overlapping live ranges, the earlier one wins.
+//!
+//! 3. Constant/nested variable collisions are special because they don't involve scope overlaps.
+//! The constant wins, the variable must notify.
+
 use bit_set::Bitset;
 use diag::Diagnostic;
 use nameck::Atom;
@@ -34,25 +53,6 @@ use util::new_map;
 use util::new_set;
 use util::ptr_eq;
 
-// This module calculates 3 things which are related only by the fact that they can be done
-// at the same time:
-//
-// 1. For $c $v $f and labelled statements ($e $f $a $p): Check for duplication
-//
-// 2. For $e $d $f $a $p: Check that all used math symbols are active in scope
-//
-// 3. For $a $p: Compute the frame
-
-// Rules of precedence for error detection and recovery:
-//
-// 1. Math symbols and labels are actually in separate namespaces.  We warn about collisions but
-// otherwise do nothing.  Variables have responsibility for the warning.
-//
-// 2. When two definitions have overlapping live ranges, the earlier one wins.
-//
-// 3. Constant/nested variable collisions are special because they don't involve scope overlaps.
-// The constant wins, the variable must notify.
-
 #[derive(Clone,Copy)]
 struct LocalVarInfo {
     start: TokenAddress,
@@ -71,6 +71,7 @@ enum CheckedToken<'a> {
     Const(TokenPtr<'a>, Atom),
     Var(TokenPtr<'a>, Atom, LocalFloatInfo),
 }
+use self::CheckedToken::*;
 
 #[derive(Clone,Debug)]
 struct LocalDvInfo {
@@ -111,15 +112,24 @@ impl Default for VerifyExpr {
 }
 
 #[derive(Clone,Debug)]
-pub struct Hyp {
-    pub address: StatementAddress,
-    pub variable_index: VarIndex,
-    pub expr: VerifyExpr,
+pub enum Hyp {
+    Essential(StatementAddress, VerifyExpr),
+    Floating(StatementAddress, VarIndex, Atom),
 }
 
 impl Hyp {
-    pub fn is_float(&self) -> bool {
-        0 != !self.variable_index
+    pub fn address(&self) -> StatementAddress {
+        match *self {
+            Hyp::Essential(addr, _) => addr,
+            Hyp::Floating(addr, _, _) => addr,
+        }
+    }
+
+    pub fn typecode(&self) -> Atom {
+        match self {
+            &Hyp::Essential(_, ref expr) => expr.typecode,
+            &Hyp::Floating(_, _, typecode) => typecode,
+        }
     }
 }
 
@@ -151,156 +161,146 @@ struct ScopeState<'a> {
     frames_out: Vec<Frame>,
 }
 
-fn push_diagnostic(state: &mut ScopeState, ix: StatementIndex, diag: Diagnostic) {
-    state.diagnostics.entry(ix).or_insert(Vec::new()).push(diag);
-}
-
-// atom will be meaningless in non-incremental mode
-fn check_label_dup(state: &mut ScopeState, sref: StatementRef) -> Option<Atom> {
-    // is the label unique in the database?
-    if let Some(def) = state.gnames.lookup_label(sref.label()) {
-        if def.address != sref.address() {
-            push_diagnostic(state, sref.index, Diagnostic::DuplicateLabel(def.address));
-            return None;
-        }
-        return Some(def.atom);
-    }
-    None // should be unreachable?
-}
-
-fn check_math_symbol(state: &mut ScopeState,
-                     sref: StatementRef,
-                     tref: TokenRef)
-                     -> Option<(SymbolType, Atom)> {
-    // active global definition?
-    if let Some(sdef) = state.gnames.lookup_symbol(tref.slice) {
-        if state.order.cmp(&sdef.address, &tref.address) == Ordering::Less {
-            return Some((sdef.stype, sdef.atom));
-        }
+impl<'a> ScopeState<'a> {
+    fn push_diagnostic(&mut self, ix: StatementIndex, diag: Diagnostic) {
+        self.diagnostics.entry(ix).or_insert(Vec::new()).push(diag);
     }
 
-    // active local definition?
-    if let Some(local_slot) = state.local_vars.get(tref.slice).and_then(|slot| slot.last()) {
-        if check_endpoint(sref.index, local_slot.end) {
-            return Some((SymbolType::Variable, local_slot.atom));
-        }
-    }
-
-    push_diagnostic(state, sref.index, Diagnostic::NotActiveSymbol(tref.index()));
-    return None;
-}
-
-fn lookup_float<'a>(state: &mut ScopeState<'a>,
-                    sref: StatementRef<'a>,
-                    tref: TokenRef<'a>)
-                    -> Option<LocalFloatInfo> {
-    // active global definition?
-    if let Some(fdef) = state.gnames.lookup_float(tref.slice) {
-        if state.order.cmp(&fdef.address, &sref.address()) == Ordering::Less {
-            return Some(LocalFloatInfo {
-                valid: fdef.address.unbounded_range(),
-                typecode: fdef.typecode_atom,
-            });
-        }
-    }
-
-    // active local definition?
-    if let Some(local_slot) = state.local_floats.get(tref.slice).and_then(|slot| slot.last()) {
-        if check_endpoint(sref.index, local_slot.valid.end) {
-            return Some(*local_slot);
-        }
-    }
-
-    None
-}
-
-fn check_eap<'a, 'b>(state: &'b mut ScopeState<'a>,
-                     sref: StatementRef<'a>)
-                     -> Option<Vec<CheckedToken<'a>>> {
-    // does the math string consist of active tokens, where the first is a constant
-    // and all variables have typecodes in scope?
-    let mut bad = false;
-    let mut out = Vec::with_capacity(sref.math_len() as usize);
-
-    for tref in sref.math_iter() {
-        match check_math_symbol(state, sref, tref) {
-            None => {
-                bad = true;
+    // atom will be meaningless in non-incremental mode
+    fn check_label_dup(&mut self, sref: StatementRef) -> Option<Atom> {
+        // is the label unique in the database?
+        if let Some(def) = self.gnames.lookup_label(sref.label()) {
+            if def.address != sref.address() {
+                self.push_diagnostic(sref.index, Diagnostic::DuplicateLabel(def.address));
+                return None;
             }
-            Some((SymbolType::Constant, atom)) => {
-                out.push(CheckedToken::Const(tref.slice, atom));
+            return Some(def.atom);
+        }
+        unreachable!()
+    }
+
+    fn check_math_symbol(&mut self,
+                         sref: StatementRef,
+                         tref: TokenRef)
+                         -> Option<(SymbolType, Atom)> {
+        // active global definition?
+        if let Some(sdef) = self.gnames.lookup_symbol(tref.slice) {
+            if self.order.cmp(&sdef.address, &tref.address) == Ordering::Less {
+                return Some((sdef.stype, sdef.atom));
             }
-            Some((SymbolType::Variable, atom)) => {
-                if tref.index() == 0 {
-                    push_diagnostic(state, sref.index, Diagnostic::ExprNotConstantPrefix(0));
-                    bad = true;
-                } else {
-                    match lookup_float(state, sref, tref) {
-                        None => {
-                            push_diagnostic(state,
-                                            sref.index,
-                                            Diagnostic::VariableMissingFloat(tref.index()));
-                            bad = true;
+        }
+
+        // active local definition?
+        if let Some(local_slot) = self.local_vars.get(tref.slice).and_then(|slot| slot.last()) {
+            if check_endpoint(sref.index, local_slot.end) {
+                return Some((SymbolType::Variable, local_slot.atom));
+            }
+        }
+
+        self.push_diagnostic(sref.index, Diagnostic::NotActiveSymbol(tref.index()));
+        None
+    }
+
+    fn lookup_float(&mut self, sref: StatementRef, tref: TokenRef) -> Option<LocalFloatInfo> {
+        // active global definition?
+        if let Some(fdef) = self.gnames.lookup_float(tref.slice) {
+            if self.order.cmp(&fdef.address, &sref.address()) == Ordering::Less {
+                return Some(LocalFloatInfo {
+                    valid: fdef.address.unbounded_range(),
+                    typecode: fdef.typecode_atom,
+                });
+            }
+        }
+
+        // active local definition?
+        if let Some(&local_slot) = self.local_floats.get(tref.slice).and_then(|slot| slot.last()) {
+            if check_endpoint(sref.index, local_slot.valid.end) {
+                return Some(local_slot);
+            }
+        }
+
+        None
+    }
+
+    fn check_eap(&mut self, sref: StatementRef<'a>) -> Option<Vec<CheckedToken<'a>>> {
+        // does the math string consist of active tokens, where the first is a constant
+        // and all variables have typecodes in scope?
+        let mut bad = false;
+        let mut out = Vec::with_capacity(sref.math_len() as usize);
+
+        for tref in sref.math_iter() {
+            match self.check_math_symbol(sref, tref) {
+                None => bad = true,
+                Some((SymbolType::Constant, atom)) => {
+                    out.push(Const(tref.slice, atom));
+                }
+                Some((SymbolType::Variable, atom)) => {
+                    if tref.index() == 0 {
+                        self.push_diagnostic(sref.index, Diagnostic::ExprNotConstantPrefix(0));
+                        bad = true;
+                    } else {
+                        match self.lookup_float(sref, tref) {
+                            None => {
+                                self.push_diagnostic(sref.index, Diagnostic::VariableMissingFloat(tref.index()));
+                                bad = true;
+                            }
+                            Some(lfi) => out.push(Var(tref.slice, atom, lfi)),
                         }
-                        Some(lfi) => out.push(CheckedToken::Var(tref.slice, atom, lfi)),
                     }
                 }
             }
         }
-    }
 
-    if bad {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-fn construct_stub_frame(state: &mut ScopeState,
-                        sref: StatementRef,
-                        latom: Atom,
-                        expr: &[CheckedToken]) {
-    // gets data for $e and $f statements; these are not frames but they
-    // are referenced by proofs using a frame-like structure
-    let mut iter = expr.iter();
-    let typecode = match iter.next().expect("parser checks $eap token count") {
-        &CheckedToken::Const(_, typecode) => typecode,
-        _ => unreachable!(),
-    };
-    let mut mvars = Vec::new();
-    let mut conststr = Vec::new();
-
-    while let Some(ctok) = iter.next() {
-        match *ctok {
-            CheckedToken::Const(tref, _) => {
-                conststr.extend_from_slice(tref);
-                *conststr.last_mut().unwrap() |= 0x80;
-            }
-            CheckedToken::Var(tref, atom, _) => {
-                conststr.extend_from_slice(tref);
-                *conststr.last_mut().unwrap() |= 0x80;
-                mvars.push(atom);
-            }
+        if bad {
+            None
+        } else {
+            Some(out)
         }
     }
 
-    state.frames_out.push(Frame {
-        stype: sref.statement.stype,
-        label_atom: latom,
-        valid: sref.scope_range(),
-        hypotheses: Box::default(),
-        target: VerifyExpr {
-            typecode: typecode,
-            rump: 0..0,
-            tail: Box::default(),
-        },
-        const_pool: Box::default(),
-        stub_expr: conststr.into_boxed_slice(),
-        mandatory_count: mvars.len(),
-        var_list: mvars.into_boxed_slice(),
-        mandatory_dv: Box::default(),
-        optional_dv: Box::default(),
-    });
+    fn construct_stub_frame(&mut self, sref: StatementRef, latom: Atom, expr: &[CheckedToken]) {
+        // gets data for $e and $f statements; these are not frames but they
+        // are referenced by proofs using a frame-like structure
+        let mut iter = expr.iter();
+        let typecode = match iter.next().expect("parser checks $eap token count") {
+            &Const(_, typecode) => typecode,
+            _ => unreachable!(),
+        };
+        let mut mvars = Vec::new();
+        let mut conststr = Vec::new();
+
+        for &ctok in iter {
+            match ctok {
+                Const(tref, _) => {
+                    conststr.extend_from_slice(tref);
+                    *conststr.last_mut().unwrap() |= 0x80;
+                }
+                Var(tref, atom, _) => {
+                    conststr.extend_from_slice(tref);
+                    *conststr.last_mut().unwrap() |= 0x80;
+                    mvars.push(atom);
+                }
+            }
+        }
+
+        self.frames_out.push(Frame {
+            stype: sref.statement.stype,
+            label_atom: latom,
+            valid: sref.scope_range(),
+            hypotheses: Box::default(),
+            target: VerifyExpr {
+                typecode: typecode,
+                rump: 0..0,
+                tail: Box::default(),
+            },
+            const_pool: Box::default(),
+            stub_expr: conststr.into_boxed_slice(),
+            mandatory_count: mvars.len(),
+            var_list: mvars.into_boxed_slice(),
+            mandatory_dv: Box::default(),
+            optional_dv: Box::default(),
+        });
+    }
 }
 
 struct InchoateFrame {
@@ -312,379 +312,340 @@ struct InchoateFrame {
     const_pool: Vec<u8>,
 }
 
-fn scan_expression<'a>(iframe: &mut InchoateFrame, expr: &[CheckedToken<'a>]) -> VerifyExpr {
-    let mut iter = expr.iter();
-    let head = match iter.next().expect("parser checks $eap token count") {
-        &CheckedToken::Const(_, head) => head,
-        _ => unreachable!(),
-    };
-    let mut open_const = iframe.const_pool.len();
-    let mut tail = Vec::with_capacity(expr.len());
-
-    while let Some(ctok) = iter.next() {
-        match *ctok {
-            CheckedToken::Const(tref, _) => {
-                fast_extend(&mut iframe.const_pool, tref);
-                *iframe.const_pool.last_mut().unwrap() |= 0x80;
-            }
-            CheckedToken::Var(_, atom, lfi) => {
-                let index = match iframe.variables.get(&atom).map(|&(x, _)| x) {
-                    Some(mvarindex) => mvarindex,
-                    None => {
-                        let index = iframe.variables.len();
-                        iframe.var_list.push(atom);
-                        iframe.optional_dv.push(Bitset::new());
-                        iframe.variables.insert(atom, (index, lfi));
-                        index
-                    }
-                };
-                tail.push(ExprFragment {
-                    prefix: open_const..iframe.const_pool.len(),
-                    var: index,
-                });
-                open_const = iframe.const_pool.len();
-            }
-        }
-    }
-
-    VerifyExpr {
-        typecode: head.to_owned(),
-        rump: open_const..iframe.const_pool.len(),
-        tail: tail.into_boxed_slice(),
-    }
-}
-
-fn scan_dv<'a>(iframe: &mut InchoateFrame, var_set: &[Atom]) {
-    // any variable encountered for the first time in a dv is an optional
-    // variable, but we already checked validity in scope_check_dv
-    let mut var_ids = Vec::with_capacity(var_set.len());
-
-    for &varatom in var_set {
-        let index = match iframe.variables.get(&varatom).map(|&(x, _)| x) {
-            Some(mvarindex) => mvarindex,
-            None => {
-                let index = iframe.variables.len();
-                iframe.var_list.push(varatom);
-                iframe.optional_dv.push(Bitset::new());
-                iframe.variables.insert(varatom, (index, Default::default()));
-                index
-            }
+impl InchoateFrame {
+    fn scan_expression(&mut self, expr: &[CheckedToken]) -> VerifyExpr {
+        let mut iter = expr.iter();
+        let head = match iter.next().expect("parser checks $eap token count") {
+            &Const(_, head) => head,
+            _ => unreachable!(),
         };
-        var_ids.push(index);
+        let mut open_const = self.const_pool.len();
+        let mut tail = Vec::with_capacity(expr.len());
+
+        for &ctok in iter {
+            match ctok {
+                Const(tref, _) => {
+                    fast_extend(&mut self.const_pool, tref);
+                    *self.const_pool.last_mut().unwrap() |= 0x80;
+                }
+                Var(_, atom, lfi) => {
+                    let index = self.variables.get(&atom).map(|&(x, _)| x).unwrap_or_else(|| {
+                        let index = self.variables.len();
+                        self.var_list.push(atom);
+                        self.optional_dv.push(Bitset::new());
+                        self.variables.insert(atom, (index, lfi));
+                        index
+                    });
+                    tail.push(ExprFragment {
+                        prefix: open_const..self.const_pool.len(),
+                        var: index,
+                    });
+                    open_const = self.const_pool.len();
+                }
+            }
+        }
+
+        VerifyExpr {
+            typecode: head.to_owned(),
+            rump: open_const..self.const_pool.len(),
+            tail: tail.into_boxed_slice(),
+        }
     }
 
-    for (leftpos, &leftid) in var_ids.iter().enumerate() {
-        for &rightid in &var_ids[leftpos + 1..] {
-            if !iframe.optional_dv[leftid].has_bit(rightid) {
-                iframe.optional_dv[leftid].set_bit(rightid);
-                iframe.optional_dv[rightid].set_bit(leftid);
-                if leftid < iframe.mandatory_count && rightid < iframe.mandatory_count {
-                    iframe.mandatory_dv.push((leftid, rightid));
+    fn scan_dv(&mut self, var_set: &[Atom]) {
+        // any variable encountered for the first time in a dv is an optional
+        // variable, but we already checked validity in scope_check_dv
+        let mut var_ids = Vec::with_capacity(var_set.len());
+
+        for &varatom in var_set {
+            let index = match self.variables.get(&varatom).map(|&(x, _)| x) {
+                Some(mvarindex) => mvarindex,
+                None => {
+                    let index = self.variables.len();
+                    self.var_list.push(varatom);
+                    self.optional_dv.push(Bitset::new());
+                    self.variables.insert(varatom, (index, Default::default()));
+                    index
+                }
+            };
+            var_ids.push(index);
+        }
+
+        for (leftpos, &leftid) in var_ids.iter().enumerate() {
+            for &rightid in &var_ids[leftpos + 1..] {
+                if !self.optional_dv[leftid].set_bit_if(rightid) {
+                    self.optional_dv[rightid].set_bit(leftid);
+                    if leftid < self.mandatory_count && rightid < self.mandatory_count {
+                        self.mandatory_dv.push((leftid, rightid));
+                    }
                 }
             }
         }
     }
 }
 
-fn construct_full_frame<'a>(state: &mut ScopeState<'a>,
-                            sref: StatementRef<'a>,
+impl<'a> ScopeState<'a> {
+    fn construct_full_frame(&mut self,
+                            sref: StatementRef,
                             label_atom: Atom,
-                            expr: &[CheckedToken<'a>]) {
-    state.local_essen.retain(|hyp| check_endpoint(sref.index, hyp.valid.end));
-    state.local_dv.retain(|hyp| check_endpoint(sref.index, hyp.valid.end));
-    // local_essen and local_dv now contain only things still in scope
+                            expr: &[CheckedToken]) {
+        self.local_essen.retain(|hyp| check_endpoint(sref.index, hyp.valid.end));
+        self.local_dv.retain(|hyp| check_endpoint(sref.index, hyp.valid.end));
+        // local_essen and local_dv now contain only things still in scope
 
-    // collect mandatory variables
-    let mut iframe = InchoateFrame {
-        variables: new_map(),
-        var_list: Vec::new(),
-        optional_dv: Vec::new(),
-        mandatory_dv: Vec::new(),
-        mandatory_count: 0,
-        const_pool: Vec::new(),
-    };
-    let mut hyps = Vec::new();
+        // collect mandatory variables
+        let mut iframe = InchoateFrame {
+            variables: new_map(),
+            var_list: Vec::new(),
+            optional_dv: Vec::new(),
+            mandatory_dv: Vec::new(),
+            mandatory_count: 0,
+            const_pool: Vec::new(),
+        };
+        let mut hyps = Vec::new();
 
-    for ess in &state.local_essen {
-        let scanned = scan_expression(&mut iframe, &ess.string);
-        hyps.push(Hyp {
-            address: ess.valid.start,
-            variable_index: !0,
-            expr: scanned,
+        for ess in &self.local_essen {
+            let scanned = iframe.scan_expression(&ess.string);
+            hyps.push(Hyp::Essential(ess.valid.start, scanned));
+        }
+
+        let scan_res = iframe.scan_expression(expr);
+
+        // include any mandatory $f hyps
+        for &(index, ref lfi) in iframe.variables.values() {
+            hyps.push(Hyp::Floating(lfi.valid.start,index, lfi.typecode));
+        }
+
+        hyps.sort_by(|h1, h2| self.order.cmp(&h1.address(), &h2.address()));
+        iframe.mandatory_count = iframe.var_list.len();
+
+        for &(_, ref vars) in self.gnames.lookup_global_dv() {
+            iframe.scan_dv(&vars)
+        }
+
+        for dv in &self.local_dv {
+            iframe.scan_dv(&dv.vars);
+        }
+
+        self.frames_out.push(Frame {
+            stype: sref.statement.stype,
+            label_atom: label_atom,
+            valid: sref.address().unbounded_range(),
+            hypotheses: hyps.into_boxed_slice(),
+            target: scan_res,
+            stub_expr: Box::default(),
+            const_pool: iframe.const_pool.into_boxed_slice(),
+            var_list: iframe.var_list.into_boxed_slice(),
+            mandatory_count: iframe.mandatory_count,
+            mandatory_dv: iframe.mandatory_dv.into_boxed_slice(),
+            optional_dv: iframe.optional_dv.into_boxed_slice(),
         });
     }
 
-    let scan_res = scan_expression(&mut iframe, expr);
-
-    // include any mandatory $f hyps
-    for &(index, ref lfi) in iframe.variables.values() {
-        hyps.push(Hyp {
-            address: lfi.valid.start,
-            variable_index: index,
-            expr: VerifyExpr {
-                typecode: lfi.typecode,
-                rump: 0..0,
-                tail: Box::default(),
-            },
-        })
-    }
-
-    hyps.sort_by(|h1, h2| state.order.cmp(&h1.address, &h2.address));
-    iframe.mandatory_count = iframe.var_list.len();
-
-    for &ref dv in &state.gnames.lookup_global_dv() {
-        scan_dv(&mut iframe, &dv.vars)
-    }
-
-    for &ref dv in &state.local_dv {
-        scan_dv(&mut iframe, &dv.vars);
-    }
-
-    state.frames_out.push(Frame {
-        stype: sref.statement.stype,
-        label_atom: label_atom,
-        valid: sref.address().unbounded_range(),
-        hypotheses: hyps.into_boxed_slice(),
-        target: scan_res,
-        stub_expr: Box::default(),
-        const_pool: iframe.const_pool.into_boxed_slice(),
-        var_list: iframe.var_list.into_boxed_slice(),
-        mandatory_count: iframe.mandatory_count,
-        mandatory_dv: iframe.mandatory_dv.into_boxed_slice(),
-        optional_dv: iframe.optional_dv.into_boxed_slice(),
-    });
-}
-
-fn scope_check_axiom<'a>(state: &mut ScopeState<'a>, sref: StatementRef<'a>) {
-    let latom = check_label_dup(state, sref);
-    if latom.is_none() {
-        return;
-    }
-
-    if let Some(expr) = check_eap(state, sref) {
-        construct_full_frame(state, sref, latom.unwrap(), &expr);
-    }
-}
-
-fn scope_check_constant(state: &mut ScopeState, sref: StatementRef) {
-    if sref.statement.group != NO_STATEMENT {
-        // assert!(sref.statement.diagnostics.len() > 0);
-        return;
-    }
-
-    for tokref in sref.math_iter() {
-        if let Some(ldef) = state.gnames.lookup_label(tokref.slice) {
-            push_diagnostic(state,
-                            sref.index,
-                            Diagnostic::SymbolDuplicatesLabel(tokref.index(), ldef.address));
-        }
-
-        if let Some(cdef) = state.gnames.lookup_symbol(tokref.slice) {
-            if cdef.address != tokref.address {
-                push_diagnostic(state,
-                                sref.index,
-                                Diagnostic::SymbolRedeclared(tokref.index(), cdef.address));
+    fn scope_check_assert(&mut self, sref: StatementRef<'a>) {
+        if let Some(latom) = self.check_label_dup(sref) {
+            if let Some(expr) = self.check_eap(sref) {
+                self.construct_full_frame(sref, latom, &expr);
             }
         }
     }
-}
 
-fn scope_check_dv<'a>(state: &mut ScopeState<'a>, sref: StatementRef<'a>) {
-    let mut used = new_map();
-    let mut bad = false;
-    let mut vars = Vec::new();
+    fn scope_check_constant(&mut self, sref: StatementRef) {
+        if sref.statement.group != NO_STATEMENT {
+            // assert!(sref.statement.diagnostics.len() > 0);
+            return;
+        }
 
-    for tref in sref.math_iter() {
-        match check_math_symbol(state, sref, tref) {
-            None => {
-                bad = true;
+        for tokref in sref.math_iter() {
+            if let Some(ldef) = self.gnames.lookup_label(tokref.slice) {
+                self.push_diagnostic(sref.index,
+                                     Diagnostic::SymbolDuplicatesLabel(tokref.index(),
+                                                                       ldef.address));
             }
-            Some((SymbolType::Constant, _)) => {
-                push_diagnostic(state, sref.index, Diagnostic::DjNotVariable(tref.index()));
-                bad = true;
+
+            if let Some(cdef) = self.gnames.lookup_symbol(tokref.slice) {
+                if cdef.address != tokref.address {
+                    self.push_diagnostic(sref.index,
+                                         Diagnostic::SymbolRedeclared(tokref.index(),
+                                                                      cdef.address));
+                }
             }
-            Some((SymbolType::Variable, varat)) => {
-                if let Some(&previx) = used.get(&varat) {
-                    push_diagnostic(state,
-                                    sref.index,
-                                    Diagnostic::DjRepeatedVariable(tref.index(), previx));
+        }
+    }
+
+    fn scope_check_dv(&mut self, sref: StatementRef) {
+        let mut used = new_map();
+        let mut bad = false;
+        let mut vars = Vec::new();
+
+        for tref in sref.math_iter() {
+            match self.check_math_symbol(sref, tref) {
+                None => bad = true,
+                Some((SymbolType::Constant, _)) => {
+                    self.push_diagnostic(sref.index, Diagnostic::DjNotVariable(tref.index()));
                     bad = true;
-                    continue;
+                }
+                Some((SymbolType::Variable, varat)) => {
+                    if let Some(&previx) = used.get(&varat) {
+                        self.push_diagnostic(sref.index,
+                                             Diagnostic::DjRepeatedVariable(tref.index(), previx));
+                        bad = true;
+                        continue;
+                    }
+
+                    used.insert(varat, tref.index());
+                    vars.push(varat);
+                }
+            }
+        }
+
+        if bad {
+            return;
+        }
+
+        if sref.statement.group == NO_STATEMENT {
+            return;
+        }
+
+        self.local_dv.push(LocalDvInfo {
+            valid: sref.scope_range(),
+            vars: vars,
+        });
+    }
+
+    fn scope_check_essential(&mut self, sref: StatementRef<'a>) {
+        if self.check_label_dup(sref).is_some() {
+            if let Some(expr) = self.check_eap(sref) {
+                self.local_essen.push(LocalEssentialInfo {
+                    valid: sref.scope_range(),
+                    label: sref.label(),
+                    string: expr,
+                });
+            }
+        }
+    }
+
+    fn scope_check_float(&mut self, sref: StatementRef) {
+        let mut bad = false;
+        assert!(sref.math_len() == 2);
+        let const_tok = sref.math_at(0);
+        let var_tok = sref.math_at(1);
+
+        let latom = match self.check_label_dup(sref) {
+            None => return,
+            Some(a) => a,
+        };
+
+        let mut const_at = Atom::default();
+        match self.check_math_symbol(sref, const_tok) {
+            None => bad = true,
+            Some((SymbolType::Constant, atom)) => const_at = atom,
+            Some((SymbolType::Variable, _)) => {
+                self.push_diagnostic(sref.index, Diagnostic::FloatNotConstant(0));
+                bad = true;
+            }
+        }
+
+        let mut var_at = Atom::default();
+        match self.check_math_symbol(sref, var_tok) {
+            None => bad = true,
+            Some((SymbolType::Variable, atom)) => var_at = atom,
+            _ => {
+                self.push_diagnostic(sref.index, Diagnostic::FloatNotVariable(1));
+                bad = true;
+            }
+        }
+
+        if bad {
+            return;
+        }
+
+        if let Some(prev) = self.lookup_float(sref, sref.math_at(1)) {
+            self.push_diagnostic(sref.index, Diagnostic::FloatRedeclared(prev.valid.start));
+            return;
+        }
+
+        // record the $f
+        if sref.statement.group_end != NO_STATEMENT {
+            self.local_floats
+                .entry(copy_token(var_tok.slice))
+                .or_insert(Vec::new())
+                .push(LocalFloatInfo {
+                    typecode: const_at,
+                    valid: sref.scope_range(),
+                });
+        }
+
+        let expr = [Const(const_tok.slice, const_at),
+                    Var(var_tok.slice, var_at, LocalFloatInfo::default())];
+        self.construct_stub_frame(sref, latom, &expr);
+    }
+
+    // factored out to make a useful borrow scope
+    fn maybe_add_local_var(&mut self,
+                           sref: StatementRef,
+                           tokref: TokenRef)
+                           -> Option<TokenAddress> {
+        let lv_slot = self.local_vars.entry(copy_token(tokref.slice)).or_insert(Vec::new());
+
+        if let Some(lv_most_recent) = lv_slot.last() {
+            if check_endpoint(sref.index, lv_most_recent.end) {
+                return Some(lv_most_recent.start);
+            }
+        }
+
+        lv_slot.push(LocalVarInfo {
+            start: tokref.address,
+            end: sref.statement.group_end,
+            atom: self.nameset.get_atom(tokref.slice),
+        });
+        None
+    }
+
+    fn scope_check_variable(&mut self, sref: StatementRef) {
+        for tokref in sref.math_iter() {
+            if let Some(ldef) = self.gnames.lookup_label(tokref.slice) {
+                self.push_diagnostic(sref.index,
+                                     Diagnostic::SymbolDuplicatesLabel(tokref.index(),
+                                                                       ldef.address));
+            }
+
+            if sref.statement.group == NO_STATEMENT {
+                // top level $v, may conflict with a prior $c
+                if let Some(cdef) = self.gnames.lookup_symbol(tokref.slice) {
+                    if cdef.address != tokref.address {
+                        self.push_diagnostic(sref.index,
+                                             Diagnostic::SymbolRedeclared(tokref.index(),
+                                                                          cdef.address));
+                    }
+                }
+            } else {
+                // nested $v, may conflict with an outer scope $v, top level $v/$c, or a _later_ $c
+                if let Some(cdef) = self.gnames.lookup_symbol(tokref.slice) {
+                    if self.order.cmp(&cdef.address, &tokref.address) == Ordering::Less {
+                        self.push_diagnostic(sref.index,
+                                             Diagnostic::SymbolRedeclared(tokref.index(),
+                                                                          cdef.address));
+                        continue;
+                    } else if cdef.stype == SymbolType::Constant {
+                        self.push_diagnostic(sref.index,
+                            Diagnostic::VariableRedeclaredAsConstant(tokref.index(), cdef.address));
+                        continue;
+                    }
                 }
 
-                used.insert(varat, tref.index());
-                vars.push(varat);
+                if let Some(prev_addr) = self.maybe_add_local_var(sref, tokref) {
+                    // local/local conflict
+                    self.push_diagnostic(sref.index,
+                                         Diagnostic::SymbolRedeclared(tokref.index(), prev_addr));
+                }
             }
         }
     }
-
-    if bad {
-        return;
-    }
-
-    if sref.statement.group == NO_STATEMENT {
-        return;
-    }
-
-    state.local_dv.push(LocalDvInfo {
-        valid: sref.scope_range(),
-        vars: vars,
-    });
-}
-
-fn scope_check_essential<'a>(state: &mut ScopeState<'a>, sref: StatementRef<'a>) {
-    let latom = check_label_dup(state, sref);
-    if latom.is_none() {
-        return;
-    }
-    if let Some(expr) = check_eap(state, sref) {
-        state.local_essen.push(LocalEssentialInfo {
-            valid: sref.scope_range(),
-            label: sref.label(),
-            string: expr,
-        });
-    }
-}
-
-fn scope_check_float<'a>(state: &mut ScopeState<'a>, sref: StatementRef<'a>) {
-    let mut bad = false;
-    assert!(sref.math_len() == 2);
-    let const_tok = sref.math_at(0);
-    let var_tok = sref.math_at(1);
-
-    let latom = check_label_dup(state, sref);
-    if latom.is_none() {
-        return;
-    }
-
-    let mut const_at = Atom::default();
-    match check_math_symbol(state, sref, const_tok) {
-        None => {
-            bad = true;
-        }
-        Some((SymbolType::Constant, atom)) => const_at = atom,
-        Some((SymbolType::Variable, _)) => {
-            push_diagnostic(state, sref.index, Diagnostic::FloatNotConstant(0));
-            bad = true;
-        }
-    }
-
-    let mut var_at = Atom::default();
-    match check_math_symbol(state, sref, var_tok) {
-        None => {
-            bad = true;
-        }
-        Some((SymbolType::Variable, atom)) => var_at = atom,
-        _ => {
-            push_diagnostic(state, sref.index, Diagnostic::FloatNotVariable(1));
-            bad = true;
-        }
-    }
-
-    if bad {
-        return;
-    }
-
-    if let Some(prev) = lookup_float(state, sref, sref.math_at(1)) {
-        push_diagnostic(state,
-                        sref.index,
-                        Diagnostic::FloatRedeclared(prev.valid.start));
-        return;
-    }
-
-    // record the $f
-    if sref.statement.group_end != NO_STATEMENT {
-        state.local_floats
-            .entry(copy_token(var_tok.slice))
-            .or_insert(Vec::new())
-            .push(LocalFloatInfo {
-                typecode: const_at,
-                valid: sref.scope_range(),
-            });
-    }
-
-    let expr = [CheckedToken::Const(const_tok.slice, const_at),
-                CheckedToken::Var(var_tok.slice, var_at, LocalFloatInfo::default())];
-    construct_stub_frame(state, sref, latom.unwrap(), &expr);
 }
 
 fn check_endpoint(cur: StatementIndex, end: StatementIndex) -> bool {
     end == NO_STATEMENT || cur < end
-}
-
-// factored out to make a useful borrow scope
-fn maybe_add_local_var(state: &mut ScopeState,
-                       sref: StatementRef,
-                       tokref: TokenRef)
-                       -> Option<TokenAddress> {
-    let lv_slot = state.local_vars.entry(copy_token(tokref.slice)).or_insert(Vec::new());
-
-    if let Some(lv_most_recent) = lv_slot.last() {
-        if check_endpoint(sref.index, lv_most_recent.end) {
-            return Some(lv_most_recent.start);
-        }
-    }
-
-    lv_slot.push(LocalVarInfo {
-        start: tokref.address,
-        end: sref.statement.group_end,
-        atom: state.nameset.get_atom(tokref.slice),
-    });
-    None
-}
-
-fn scope_check_provable<'a>(state: &mut ScopeState<'a>, sref: StatementRef<'a>) {
-    let latom = check_label_dup(state, sref);
-    if latom.is_none() {
-        return;
-    }
-    if let Some(expr) = check_eap(state, sref) {
-        construct_full_frame(state, sref, latom.unwrap(), &expr);
-    }
-}
-
-fn scope_check_variable(state: &mut ScopeState, sref: StatementRef) {
-    for tokref in sref.math_iter() {
-        if let Some(ldef) = state.gnames.lookup_label(tokref.slice) {
-            push_diagnostic(state,
-                            sref.index,
-                            Diagnostic::SymbolDuplicatesLabel(tokref.index(), ldef.address));
-        }
-
-        if sref.statement.group == NO_STATEMENT {
-            // top level $v, may conflict with a prior $c
-            if let Some(cdef) = state.gnames.lookup_symbol(tokref.slice) {
-                if cdef.address != tokref.address {
-                    push_diagnostic(state,
-                                    sref.index,
-                                    Diagnostic::SymbolRedeclared(tokref.index(), cdef.address));
-                }
-            }
-        } else {
-            // nested $v, may conflict with an outer scope $v, top level $v/$c, or a _later_ $c
-            if let Some(cdef) = state.gnames.lookup_symbol(tokref.slice) {
-                if state.order.cmp(&cdef.address, &tokref.address) == Ordering::Less {
-                    push_diagnostic(state,
-                                    sref.index,
-                                    Diagnostic::SymbolRedeclared(tokref.index(), cdef.address));
-                    continue;
-                } else if cdef.stype == SymbolType::Constant {
-                    push_diagnostic(state,
-                                    sref.index,
-                                    Diagnostic::VariableRedeclaredAsConstant(tokref.index(),
-                                                                             cdef.address));
-                    continue;
-                }
-            }
-
-            if let Some(prev_addr) = maybe_add_local_var(state, sref, tokref) {
-                // local/local conflict
-                push_diagnostic(state,
-                                sref.index,
-                                Diagnostic::SymbolRedeclared(tokref.index(), prev_addr));
-            }
-        }
-    }
 }
 
 pub struct SegmentScopeResult {
@@ -713,13 +674,13 @@ pub fn scope_check_single(sset: &SegmentSet,
 
     for sref in seg.statement_iter() {
         match sref.statement.stype {
-            StatementType::Axiom => scope_check_axiom(&mut state, sref),
-            StatementType::Constant => scope_check_constant(&mut state, sref),
-            StatementType::Disjoint => scope_check_dv(&mut state, sref),
-            StatementType::Essential => scope_check_essential(&mut state, sref),
-            StatementType::Floating => scope_check_float(&mut state, sref),
-            StatementType::Provable => scope_check_provable(&mut state, sref),
-            StatementType::Variable => scope_check_variable(&mut state, sref),
+            StatementType::Axiom => state.scope_check_assert(sref),
+            StatementType::Constant => state.scope_check_constant(sref),
+            StatementType::Disjoint => state.scope_check_dv(sref),
+            StatementType::Essential => state.scope_check_essential(sref),
+            StatementType::Floating => state.scope_check_float(sref),
+            StatementType::Provable => state.scope_check_assert(sref),
+            StatementType::Variable => state.scope_check_variable(sref),
             _ => {}
         }
     }
@@ -746,10 +707,10 @@ pub struct ScopeResult {
 impl ScopeResult {
     pub fn diagnostics(&self) -> Vec<(StatementAddress, Diagnostic)> {
         let mut out = Vec::new();
-        for (sid, &ref ssro) in self.segments.iter().enumerate() {
-            if let Some(ref ssr) = *ssro {
-                for (&six, &ref diag) in &ssr.diagnostics {
-                    for &ref d in diag {
+        for (sid, ssro) in self.segments.iter().enumerate() {
+            if let &Some(ref ssr) = ssro {
+                for (&six, diag) in &ssr.diagnostics {
+                    for d in diag {
                         out.push((StatementAddress::new(SegmentId(sid as u32), six), d.clone()));
                     }
                 }
@@ -760,12 +721,8 @@ impl ScopeResult {
 }
 
 pub fn scope_check(result: &mut ScopeResult, segments: &Arc<SegmentSet>, names: &Arc<Nameset>) {
-    if result.frame_index.is_empty() {
-        result.incremental = true;
-    }
-    if !segments.options.incremental {
-        result.incremental = false;
-    }
+    result.incremental |= result.frame_index.is_empty();
+    result.incremental &= segments.options.incremental;
     result.generation += 1;
     let gen = result.generation;
     let mut ssrq = VecDeque::new();
@@ -783,8 +740,7 @@ pub fn scope_check(result: &mut ScopeResult, segments: &Arc<SegmentSet>, names: 
             ssrq.push_back(segments.exec.exec(sref.bytes(), move || {
                 let sref = segments2.segment(id);
                 if let Some(old_res) = osr {
-                    if old_res.name_usage.valid(&names) &&
-                       ptr_eq::<Segment>(&old_res.source, sref.segment) {
+                    if old_res.name_usage.valid(&names) && ptr_eq(&old_res.source, sref.segment) {
                         return None;
                     }
                 }
@@ -800,7 +756,7 @@ pub fn scope_check(result: &mut ScopeResult, segments: &Arc<SegmentSet>, names: 
     let mut stale_ids = new_set();
     let mut to_add = Vec::new();
 
-    for (sid, &ref res) in result.segments.iter().enumerate() {
+    for (sid, res) in result.segments.iter().enumerate() {
         if res.is_some() {
             stale_ids.insert(SegmentId(sid as u32));
         }
@@ -825,8 +781,7 @@ pub fn scope_check(result: &mut ScopeResult, segments: &Arc<SegmentSet>, names: 
         };
         for frame in &oseg.frames_out {
             let label = sref.statement(frame.valid.start.index).label();
-            let old = result.frame_index.remove(label);
-            assert!(old.is_some(), "check_label_dup should prevent this");
+            result.frame_index.remove(label).expect("check_label_dup should prevent this");
         }
     }
 
@@ -855,7 +810,7 @@ pub struct ScopeReader<'a> {
 }
 
 impl<'a> ScopeReader<'a> {
-    pub fn new(res: &'a ScopeResult) -> ScopeReader<'a> {
+    pub fn new(res: &ScopeResult) -> ScopeReader {
         ScopeReader {
             result: res,
             incremental: res.incremental,
@@ -901,27 +856,10 @@ pub struct ScopeUsage {
 
 impl ScopeUsage {
     pub fn valid(&self, name: &Nameset, res: &ScopeResult) -> bool {
-        if !self.incremental && res.generation > self.generation {
-            return false;
-        }
-
-        for &atom in &self.found {
-            match res.frame_index.get(name.atom_name(atom)) {
-                None => return false,
-                Some(&(gen, _segid, _frix)) => {
-                    if gen > self.generation {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        for &ref name in &self.not_found {
-            if res.frame_index.contains_key(name) {
-                return false;
-            }
-        }
-
-        return true;
+        (self.incremental || res.generation <= self.generation) &&
+        self.found.iter().all(|&atom| match res.frame_index.get(name.atom_name(atom)) {
+            None => false,
+            Some(&(gen, _segid, _frix)) => gen <= self.generation,
+        }) && self.not_found.iter().all(|name| !res.frame_index.contains_key(name))
     }
 }

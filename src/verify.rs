@@ -14,17 +14,21 @@ use parser::StatementAddress;
 use parser::StatementRef;
 use parser::StatementType;
 use parser::TokenPtr;
+use scopeck;
 use scopeck::ExprFragment;
 use scopeck::Frame;
-use scopeck::Hyp;
+use scopeck::Hyp::*;
 use scopeck::ScopeReader;
 use scopeck::ScopeResult;
 use scopeck::ScopeUsage;
 use scopeck::VerifyExpr;
 use segment_set::SegmentSet;
+use self::PreparedStep::Assert;
+use self::PreparedStep::Hyp;
 use std::cmp::Ordering;
 use std::mem;
 use std::ops::Range;
+use std::result;
 use std::sync::Arc;
 use std::u32;
 use std::usize;
@@ -61,91 +65,275 @@ struct VerifyState<'a> {
     dv_map: &'a [Bitset],
 }
 
-fn map_var<'a>(state: &mut VerifyState<'a>, token: Atom) -> usize {
-    let nbit = state.var2bit.len();
-    *state.var2bit.entry(token).or_insert(nbit)
-}
+type Result<T> = result::Result<T, Diagnostic>;
 
-// the initial hypotheses are accessed directly to avoid having to look up their names
-fn prepare_hypothesis<'a>(state: &mut VerifyState, hyp: &'a Hyp) {
-    let mut vars = Bitset::new();
-    let tos = state.stack_buffer.len();
-
-    if hyp.is_float() {
-        fast_extend(&mut state.stack_buffer,
-                    state.nameset.atom_name(state.cur_frame.var_list[hyp.variable_index]));
-        *state.stack_buffer.last_mut().unwrap() |= 0x80;
-        vars.set_bit(hyp.variable_index); // and we have prior knowledge it's identity mapped
-    } else {
-        for part in &*hyp.expr.tail {
-            fast_extend(&mut state.stack_buffer,
-                        &state.cur_frame.const_pool[part.prefix.clone()]);
-            fast_extend(&mut state.stack_buffer,
-                        state.nameset.atom_name(state.cur_frame.var_list[part.var]));
-            *state.stack_buffer.last_mut().unwrap() |= 0x80;
-            vars.set_bit(part.var); // and we have prior knowledge it's identity mapped
-        }
-        fast_extend(&mut state.stack_buffer,
-                    &state.cur_frame.const_pool[hyp.expr.rump.clone()]);
+impl<'a> VerifyState<'a> {
+    fn map_var(&mut self, token: Atom) -> usize {
+        let nbit = self.var2bit.len();
+        *self.var2bit.entry(token).or_insert(nbit)
     }
 
-    let ntos = state.stack_buffer.len();
-    state.prepared.push(PreparedStep::Hyp(vars, hyp.expr.typecode, tos..ntos));
-}
-
-/// Adds a named $e hypothesis to the prepared array.  These are not kept in the frame
-/// array due to infrequent use, so other measures are needed.
-fn prepare_named_hyp(state: &mut VerifyState, label: TokenPtr) -> Option<Diagnostic> {
-    for hyp in &*state.cur_frame.hypotheses {
-        if hyp.is_float() {
-            continue;
-        }
-        assert!(hyp.address.segment_id == state.this_seg.id);
-        if state.this_seg.statement(hyp.address.index).label() == label {
-            prepare_hypothesis(state, hyp);
-            return None;
-        }
-    }
-    return Some(Diagnostic::StepMissing(copy_token(label)));
-}
-
-fn prepare_step(state: &mut VerifyState, label: TokenPtr) -> Option<Diagnostic> {
-    let frame = match state.scoper.get(label) {
-        Some(fp) => fp,
-        None => {
-            return prepare_named_hyp(state, label);
-        }
-    };
-
-    let valid = frame.valid;
-    let pos = state.cur_frame.valid.start;
-    if state.order.cmp(&pos, &valid.start) != Ordering::Greater {
-        return Some(Diagnostic::StepUsedBeforeDefinition(copy_token(label)));
-    }
-
-    if valid.end != NO_STATEMENT {
-        if pos.segment_id != valid.start.segment_id || pos.index >= valid.end {
-            return Some(Diagnostic::StepUsedAfterScope(copy_token(label)));
-        }
-    }
-
-    if frame.stype == StatementType::Axiom || frame.stype == StatementType::Provable {
-        state.prepared.push(PreparedStep::Assert(frame));
-    } else {
+    // the initial hypotheses are accessed directly to avoid having to look up their names
+    fn prepare_hypothesis(&mut self, hyp: &'a scopeck::Hyp) {
         let mut vars = Bitset::new();
+        let tos = self.stack_buffer.len();
 
-        for &var in &*frame.var_list {
-            vars.set_bit(map_var(state, var));
+        match hyp {
+            &Floating(_addr, var_index, _typecode) => {
+                fast_extend(&mut self.stack_buffer,
+                            self.nameset.atom_name(self.cur_frame.var_list[var_index]));
+                *self.stack_buffer.last_mut().unwrap() |= 0x80;
+                vars.set_bit(var_index); // and we have prior knowledge it's identity mapped
+            }
+            &Essential(_addr, ref expr) => {
+                for part in &*expr.tail {
+                    fast_extend(&mut self.stack_buffer,
+                                &self.cur_frame.const_pool[part.prefix.clone()]);
+                    fast_extend(&mut self.stack_buffer,
+                                self.nameset.atom_name(self.cur_frame.var_list[part.var]));
+                    *self.stack_buffer.last_mut().unwrap() |= 0x80;
+                    vars.set_bit(part.var); // and we have prior knowledge it's identity mapped
+                }
+                fast_extend(&mut self.stack_buffer,
+                            &self.cur_frame.const_pool[expr.rump.clone()]);
+            }
         }
 
-        let tos = state.stack_buffer.len();
-        fast_extend(&mut state.stack_buffer, &frame.stub_expr);
-        let ntos = state.stack_buffer.len();
-        state.prepared
-            .push(PreparedStep::Hyp(vars, frame.target.typecode, tos..ntos));
+        let ntos = self.stack_buffer.len();
+        self.prepared.push(Hyp(vars, hyp.typecode(), tos..ntos));
     }
 
-    return None;
+    /// Adds a named $e hypothesis to the prepared array.  These are not kept in the frame
+    /// array due to infrequent use, so other measures are needed.
+    fn prepare_named_hyp(&mut self, label: TokenPtr) -> Result<()> {
+        for hyp in &*self.cur_frame.hypotheses {
+            if let &Essential(addr, _) = hyp {
+                assert!(addr.segment_id == self.this_seg.id);
+                if self.this_seg.statement(addr.index).label() == label {
+                    self.prepare_hypothesis(hyp);
+                    return Ok(());
+                }
+            }
+        }
+        return Err(Diagnostic::StepMissing(copy_token(label)));
+    }
+
+    fn prepare_step(&mut self, label: TokenPtr) -> Result<()> {
+        let frame = match self.scoper.get(label) {
+            Some(fp) => fp,
+            None => return self.prepare_named_hyp(label),
+        };
+
+        let valid = frame.valid;
+        let pos = self.cur_frame.valid.start;
+        try_assert!(self.order.cmp(&pos, &valid.start) == Ordering::Greater,
+                    Diagnostic::StepUsedBeforeDefinition(copy_token(label)));
+
+        try_assert!(valid.end == NO_STATEMENT ||
+                    pos.segment_id == valid.start.segment_id && pos.index < valid.end,
+                    Diagnostic::StepUsedAfterScope(copy_token(label)));
+
+        if frame.stype == StatementType::Axiom || frame.stype == StatementType::Provable {
+            self.prepared.push(Assert(frame));
+        } else {
+            let mut vars = Bitset::new();
+
+            for &var in &*frame.var_list {
+                vars.set_bit(self.map_var(var));
+            }
+
+            let tos = self.stack_buffer.len();
+            fast_extend(&mut self.stack_buffer, &frame.stub_expr);
+            let ntos = self.stack_buffer.len();
+            self.prepared
+                .push(Hyp(vars, frame.target.typecode, tos..ntos));
+        }
+
+        return Ok(());
+    }
+
+    fn execute_step(&mut self, index: usize) -> Result<()> {
+        try_assert!(index < self.prepared.len(), Diagnostic::StepOutOfRange);
+
+        let fref = match self.prepared[index] {
+            Hyp(ref vars, code, ref expr) => {
+                self.stack.push(StackSlot {
+                    vars: vars.clone(),
+                    code: code,
+                    expr: expr.clone(),
+                });
+                return Ok(());
+            }
+            Assert(fref) => fref,
+        };
+
+        let sbase = try!(self.stack
+            .len()
+            .checked_sub(fref.hypotheses.len())
+            .ok_or(Diagnostic::ProofUnderflow));
+
+        while self.subst_info.len() < fref.mandatory_count {
+            // this is mildly unhygenic, since slots corresponding to $e hyps won't get cleared, but
+            // scopeck shouldn't generate references to them
+            self.subst_info.push((0..0, Bitset::new()));
+        }
+
+        // check $f, build substitution
+        // check $e
+        // metamath spec guarantees $f will always come before any $e they affect (!)
+        for (ix, hyp) in fref.hypotheses.iter().enumerate() {
+            let slot = &self.stack[sbase + ix];
+
+            // schedule a memory ref and nice predicable branch before the ugly branch
+            match hyp {
+                &Floating(_addr, var_index, typecode) => {
+                    try_assert!(slot.code == typecode, Diagnostic::StepFloatWrongType);
+                    self.subst_info[var_index] = (slot.expr.clone(), slot.vars.clone());
+                }
+                &Essential(_addr, ref expr) => {
+                    try_assert!(slot.code == expr.typecode, Diagnostic::StepEssenWrongType);
+                    try_assert!(do_substitute_eq(&self.stack_buffer[slot.expr.clone()],
+                                                 fref,
+                                                 &expr,
+                                                 &self.subst_info,
+                                                 &self.stack_buffer),
+                                Diagnostic::StepEssenWrong);
+                }
+            }
+        }
+
+        let tos = self.stack_buffer.len();
+        do_substitute(&mut self.stack_buffer, fref, &fref.target, &self.subst_info);
+        let ntos = self.stack_buffer.len();
+
+        self.stack.truncate(sbase);
+        self.stack.push(StackSlot {
+            code: fref.target.typecode,
+            vars: do_substitute_vars(&fref.target.tail, &self.subst_info),
+            expr: tos..ntos,
+        });
+
+        // check $d
+        for &(ix1, ix2) in &*fref.mandatory_dv {
+            for var1 in &self.subst_info[ix1].1 {
+                try_assert!(self.subst_info[ix2].1.le_opt(self.dv_map.get(var1)),
+                            Diagnostic::ProofDvViolation);
+            }
+        }
+
+        return Ok(());
+    }
+
+    fn finalize_step(&mut self) -> Result<()> {
+        try_assert!(self.stack.len() <= 1, Diagnostic::ProofExcessEnd);
+        let tos = try!(self.stack.last().ok_or(Diagnostic::ProofNoSteps));
+
+        try_assert!(tos.code == self.cur_frame.target.typecode,
+                    Diagnostic::ProofWrongTypeEnd);
+
+        fast_clear(&mut self.temp_buffer);
+        do_substitute_raw(&mut self.temp_buffer, &self.cur_frame, self.nameset);
+
+        try_assert!(self.stack_buffer[tos.expr.clone()] == self.temp_buffer[..],
+                    Diagnostic::ProofWrongExprEnd);
+
+        Ok(())
+    }
+
+    fn save_step(&mut self) {
+        let top = self.stack.last().expect("can_save should prevent getting here");
+        self.prepared.push(Hyp(top.vars.clone(), top.code, top.expr.clone()));
+    }
+
+    // proofs are not self-synchronizing, so it's not likely to get >1 usable error
+    fn verify_proof(&mut self, stmt: StatementRef<'a>) -> Result<()> {
+        // only intend to check $p selfments
+        if stmt.statement.stype != StatementType::Provable {
+            return Ok(());
+        }
+
+        // no valid frame -> no use checking
+        // may wish to record a secondary error?
+        let cur_frame = match self.scoper.get(stmt.label()) {
+            None => return Ok(()),
+            Some(x) => x,
+        };
+
+        self.cur_frame = cur_frame;
+        self.stack.clear();
+        fast_clear(&mut self.stack_buffer);
+        self.prepared.clear();
+        self.var2bit.clear();
+        self.dv_map = &cur_frame.optional_dv;
+        // temp_buffer and subst_info are cleared before use
+
+        for (index, &tokr) in cur_frame.var_list.iter().enumerate() {
+            self.var2bit.insert(tokr, index);
+        }
+
+        if stmt.proof_slice_at(0) == b"(" {
+            let mut i = 1;
+
+            for hyp in &*cur_frame.hypotheses {
+                self.prepare_hypothesis(hyp);
+            }
+
+            loop {
+                try_assert!(i < stmt.proof_len(), Diagnostic::ProofUnterminatedRoster);
+
+                let chunk = stmt.proof_slice_at(i);
+                i += 1;
+
+                if chunk == b")" {
+                    break;
+                }
+
+                try!(self.prepare_step(chunk));
+            }
+
+            let mut k = 0usize;
+            let mut can_save = false;
+            while i < stmt.proof_len() {
+                let chunk = stmt.proof_slice_at(i);
+                for &ch in chunk {
+                    if ch >= b'A' && ch <= b'T' {
+                        k = k * 20 + (ch - b'A') as usize;
+                        try!(self.execute_step(k));
+                        k = 0;
+                        can_save = true;
+                    } else if ch >= b'U' && ch <= b'Y' {
+                        k = k * 5 + 1 + (ch - b'U') as usize;
+                        try_assert!(k < (u32::max_value() as usize / 20) - 1,
+                                    Diagnostic::ProofMalformedVarint);
+                        can_save = false;
+                    } else if ch == b'Z' {
+                        try_assert!(can_save, Diagnostic::ProofInvalidSave);
+                        self.save_step();
+                        can_save = false;
+                    } else if ch == b'?' {
+                        try_assert!(k == 0, Diagnostic::ProofMalformedVarint);
+                        return Err(Diagnostic::ProofIncomplete);
+                    }
+                }
+                i += 1;
+            }
+
+            try_assert!(k == 0, Diagnostic::ProofMalformedVarint);
+        } else {
+            let mut count = 0;
+            for i in 0..stmt.proof_len() {
+                let chunk = stmt.proof_slice_at(i);
+                try_assert!(chunk != b"?", Diagnostic::ProofIncomplete);
+                try!(self.prepare_step(chunk));
+                try!(self.execute_step(count));
+                count += 1;
+            }
+        }
+
+        try!(self.finalize_step());
+
+        return Ok(());
+    }
 }
 
 fn do_substitute(target: &mut Vec<u8>,
@@ -167,14 +355,11 @@ fn do_substitute_eq(mut compare: &[u8],
                     -> bool {
     fn step(compare: &mut &[u8], slice: &[u8]) -> bool {
         let len = slice.len();
-        if (*compare).len() < len {
-            return true;
-        }
-        if slice != &(*compare)[0..len] {
+        if compare.len() < len || slice != &(*compare)[0..len] {
             return true;
         }
         *compare = &(*compare)[len..];
-        return false;
+        false
     }
 
     for part in &*expr.tail {
@@ -186,11 +371,7 @@ fn do_substitute_eq(mut compare: &[u8],
         }
     }
 
-    if step(&mut compare, &frame.const_pool[expr.rump.clone()]) {
-        return false;
-    }
-
-    return compare.is_empty();
+    !step(&mut compare, &frame.const_pool[expr.rump.clone()]) && compare.is_empty()
 }
 
 fn do_substitute_raw(target: &mut Vec<u8>, frame: &Frame, nameset: &Nameset) {
@@ -210,229 +391,6 @@ fn do_substitute_vars(expr: &[ExprFragment], vars: &[(Range<usize>, Bitset)]) ->
     out
 }
 
-fn execute_step(state: &mut VerifyState, index: usize) -> Option<Diagnostic> {
-    if index >= state.prepared.len() {
-        return Some(Diagnostic::StepOutOfRange);
-    }
-
-    let fref = match state.prepared[index] {
-        PreparedStep::Hyp(ref vars, code, ref expr) => {
-            state.stack.push(StackSlot {
-                vars: vars.clone(),
-                code: code,
-                expr: expr.clone(),
-            });
-            return None;
-        }
-        PreparedStep::Assert(fref) => fref,
-    };
-
-    if state.stack.len() < fref.hypotheses.len() {
-        return Some(Diagnostic::ProofUnderflow);
-    }
-    let sbase = state.stack.len() - fref.hypotheses.len();
-
-    while state.subst_info.len() < fref.mandatory_count {
-        // this is mildly unhygenic, since slots corresponding to $e hyps won't get cleared, but
-        // scopeck shouldn't generate references to them
-        state.subst_info.push((0..0, Bitset::new()));
-    }
-
-    // check $f, build substitution
-    // check $e
-    // metamath spec guarantees $f will always come before any $e they affect (!)
-    for (ix, hyp) in fref.hypotheses.iter().enumerate() {
-        let slot = &state.stack[sbase + ix];
-
-        // schedule a memory ref and nice predicable branch before the ugly branch
-        if slot.code != hyp.expr.typecode {
-            if hyp.is_float() {
-                return Some(Diagnostic::StepFloatWrongType);
-            } else {
-                return Some(Diagnostic::StepEssenWrongType);
-            }
-        }
-
-        if hyp.is_float() {
-            state.subst_info[hyp.variable_index] = (slot.expr.clone(), slot.vars.clone());
-        } else {
-            if !do_substitute_eq(&state.stack_buffer[slot.expr.clone()],
-                                 fref,
-                                 &hyp.expr,
-                                 &state.subst_info,
-                                 &state.stack_buffer) {
-                return Some(Diagnostic::StepEssenWrong);
-            }
-        }
-    }
-
-    let tos = state.stack_buffer.len();
-    do_substitute(&mut state.stack_buffer,
-                  fref,
-                  &fref.target,
-                  &state.subst_info);
-    let ntos = state.stack_buffer.len();
-
-    state.stack.truncate(sbase);
-    state.stack.push(StackSlot {
-        code: fref.target.typecode,
-        vars: do_substitute_vars(&fref.target.tail, &state.subst_info),
-        expr: tos..ntos,
-    });
-
-    // check $d
-    for &(ix1, ix2) in &*fref.mandatory_dv {
-        for var1 in &state.subst_info[ix1].1 {
-            for var2 in &state.subst_info[ix2].1 {
-                if var1 >= state.dv_map.len() || !state.dv_map[var1].has_bit(var2) {
-                    return Some(Diagnostic::ProofDvViolation);
-                }
-            }
-        }
-    }
-
-    return None;
-}
-
-fn finalize_step(state: &mut VerifyState) -> Option<Diagnostic> {
-    if state.stack.len() == 0 {
-        return Some(Diagnostic::ProofNoSteps);
-    }
-    if state.stack.len() > 1 {
-        return Some(Diagnostic::ProofExcessEnd);
-    }
-    let tos = state.stack.last().unwrap();
-
-    if tos.code != state.cur_frame.target.typecode {
-        return Some(Diagnostic::ProofWrongTypeEnd);
-    }
-
-    fast_clear(&mut state.temp_buffer);
-    do_substitute_raw(&mut state.temp_buffer, &state.cur_frame, state.nameset);
-
-    if state.stack_buffer[tos.expr.clone()] != state.temp_buffer[..] {
-        return Some(Diagnostic::ProofWrongExprEnd);
-    }
-
-    None
-}
-
-fn save_step(state: &mut VerifyState) {
-    let top = state.stack.last().expect("can_save should prevent getting here");
-    state.prepared.push(PreparedStep::Hyp(top.vars.clone(), top.code, top.expr.clone()));
-}
-
-// proofs are not self-synchronizing, so it's not likely to get >1 usable error
-fn verify_proof<'a>(state: &mut VerifyState<'a>, stmt: StatementRef<'a>) -> Option<Diagnostic> {
-    // only intend to check $p statements
-    if stmt.statement.stype != StatementType::Provable {
-        return None;
-    }
-
-    // no valid frame -> no use checking
-    // may wish to record a secondary error?
-    let cur_frame = match state.scoper.get(stmt.label()) {
-        None => return None,
-        Some(x) => x,
-    };
-
-    state.cur_frame = cur_frame;
-    state.stack.clear();
-    fast_clear(&mut state.stack_buffer);
-    state.prepared.clear();
-    state.var2bit.clear();
-    state.dv_map = &cur_frame.optional_dv;
-    // temp_buffer and subst_info are cleared before use
-
-    for (index, &tokr) in cur_frame.var_list.iter().enumerate() {
-        state.var2bit.insert(tokr, index);
-    }
-
-    if stmt.proof_slice_at(0) == b"(" {
-        let mut i = 1;
-
-        for hyp in &*cur_frame.hypotheses {
-            prepare_hypothesis(state, hyp);
-        }
-
-        loop {
-            if i >= stmt.proof_len() {
-                return Some(Diagnostic::ProofUnterminatedRoster);
-            }
-            let chunk = stmt.proof_slice_at(i);
-            i += 1;
-
-            if chunk == b")" {
-                break;
-            }
-
-            if let Some(err) = prepare_step(state, chunk) {
-                return Some(err);
-            }
-        }
-
-        let mut k = 0usize;
-        let mut can_save = false;
-        while i < stmt.proof_len() {
-            let chunk = stmt.proof_slice_at(i);
-            for &ch in chunk {
-                if ch >= b'A' && ch <= b'T' {
-                    k = k * 20 + (ch - b'A') as usize;
-                    if let Some(err) = execute_step(state, k) {
-                        return Some(err);
-                    }
-                    k = 0;
-                    can_save = true;
-                } else if ch >= b'U' && ch <= b'Y' {
-                    k = k * 5 + 1 + (ch - b'U') as usize;
-                    if k >= (u32::max_value() as usize / 20) - 1 {
-                        return Some(Diagnostic::ProofMalformedVarint);
-                    }
-                    can_save = false;
-                } else if ch == b'Z' {
-                    if !can_save {
-                        return Some(Diagnostic::ProofInvalidSave);
-                    }
-                    save_step(state);
-                    can_save = false;
-                } else if ch == b'?' {
-                    if k > 0 {
-                        return Some(Diagnostic::ProofMalformedVarint);
-                    }
-                    return Some(Diagnostic::ProofIncomplete);
-                }
-            }
-            i += 1;
-        }
-
-        if k > 0 {
-            return Some(Diagnostic::ProofMalformedVarint);
-        }
-    } else {
-        let mut count = 0;
-        for i in 0..stmt.proof_len() {
-            let chunk = stmt.proof_slice_at(i);
-            if chunk == b"?" {
-                return Some(Diagnostic::ProofIncomplete);
-            } else {
-                if let Some(err) = prepare_step(state, chunk) {
-                    return Some(err);
-                }
-                if let Some(err) = execute_step(state, count) {
-                    return Some(err);
-                }
-                count += 1;
-            }
-        }
-    }
-
-    if let Some(err) = finalize_step(state) {
-        return Some(err);
-    }
-
-    return None;
-}
-
 struct VerifySegment {
     source: Arc<Segment>,
     scope_usage: ScopeUsage,
@@ -446,13 +404,10 @@ pub struct VerifyResult {
 
 impl VerifyResult {
     pub fn diagnostics(&self) -> Vec<(StatementAddress, Diagnostic)> {
-        let mut out = Vec::new();
-        for vsr in self.segments.values() {
-            for (&sa, &ref diag) in &vsr.diagnostics {
-                out.push((sa, diag.clone()));
-            }
-        }
-        out
+        self.segments
+            .values()
+            .flat_map(|vsr| vsr.diagnostics.iter().map(|(&sa, diag)| (sa, diag.clone())))
+            .collect()
     }
 }
 
@@ -479,7 +434,7 @@ fn verify_segment(sset: &SegmentSet,
         dv_map: &dummy_frame.optional_dv,
     };
     for stmt in sref.statement_iter() {
-        if let Some(diag) = verify_proof(&mut state, stmt) {
+        if let Err(diag) = state.verify_proof(stmt) {
             diagnostics.insert(stmt.address(), diag);
         }
     }
@@ -506,7 +461,7 @@ pub fn verify(result: &mut VerifyResult,
             let sref = segments2.segment(id);
             if let Some(old_res) = old_res_o {
                 if old_res.scope_usage.valid(&nset, &scope) &&
-                   ptr_eq::<Segment>(&old_res.source, sref.segment) {
+                   ptr_eq(&old_res.source, sref.segment) {
                     return (id, old_res.clone());
                 }
             }
