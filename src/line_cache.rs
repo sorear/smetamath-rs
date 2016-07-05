@@ -1,6 +1,7 @@
 //! Utilities for source-offset/line-number mapping.
 
 use std::cmp::Ordering;
+use std::num::Wrapping;
 use util::HashMap;
 
 const PAGE: usize = 256;
@@ -31,18 +32,19 @@ fn make_index(mut buf: &[u8]) -> Vec<u32> {
     while buf.len() >= PAGE {
         let mut page = &buf[0..PAGE];
         buf = &buf[PAGE..];
-        // use an i8 accumulator to maximize the effectiveness of vectorization.
-        // do blocks of 128 because we don't want to overflow the i8.  count
+        // use a u8 accumulator to maximize the effectiveness of vectorization.
+        // do blocks of 256 because we don't want to overflow the u8.  count
         // down because all vector hardware supported by Rust generates fewer
         // instructions that way (the natural compare instructions produce 0 and
-        // -1, not 0 and 1).
-        while page.len() >= 128 {
-            let mut inner = 0i8;
-            for &ch in &page[0..128] {
-                inner += -((ch == b'\n') as i8);
+        // -1, not 0 and 1).  We use the u8 to store a wrapped value in the range
+        // -255..0.
+        while page.len() >= 256 {
+            let mut inner = Wrapping(0u8);
+            for &ch in &page[0..256] {
+                inner += -Wrapping((ch == b'\n') as u8);
             }
-            page = &page[128..];
-            count += (inner as u8).wrapping_neg() as u32;
+            page = &page[256..];
+            count += (-inner).0 as u32;
         }
         out.push(count);
     }
