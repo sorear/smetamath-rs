@@ -25,7 +25,6 @@ use std::ops::Range;
 use std::u16;
 use verify::ProofBuilder;
 use verify::verify_one;
-use util::new_map;
 
 /// A tree structure for storing proofs and grammar derivations.
 #[derive(Clone,Debug,Eq)]
@@ -719,7 +718,7 @@ impl<'a> fmt::Display for ProofTreePrinter<'a> {
                 f,
                 indent,
                 chr: self.indent - 1,
-                stmt_lookup: new_map(),
+                stmt_lookup: hash_map::HashMap::new(),
                 backref_alloc: vec![],
                 backref_max: 0,
             }
