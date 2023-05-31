@@ -101,7 +101,6 @@ struct LocalDvInfo {
 #[derive(Clone,Debug)]
 struct LocalEssentialInfo<'a> {
     valid: GlobalRange,
-    label: TokenPtr<'a>,
     string: Vec<CheckedToken<'a>>,
 }
 
@@ -419,7 +418,7 @@ fn construct_stub_frame(state: &mut ScopeState,
         valid: sref.scope_range(),
         hypotheses: Box::default(),
         target: VerifyExpr {
-            typecode: typecode,
+            typecode,
             rump: 0..0,
             tail: Box::default(),
         },
@@ -587,7 +586,7 @@ fn construct_full_frame<'a>(state: &mut ScopeState<'a>,
 
     state.frames_out.push(Frame {
         stype: sref.statement_type(),
-        label_atom: label_atom,
+        label_atom,
         valid: sref.address().unbounded_range(),
         hypotheses: hyps.into_boxed_slice(),
         target: scan_res,
@@ -673,7 +672,7 @@ fn scope_check_dv<'a>(state: &mut ScopeState<'a>, sref: StatementRef<'a>) {
         // construct_full_frame when it's no longer in scope
         state.local_dv.push(LocalDvInfo {
             valid: sref.scope_range(),
-            vars: vars,
+            vars,
         });
     }
 }
@@ -685,7 +684,6 @@ fn scope_check_essential<'a>(state: &mut ScopeState<'a>, sref: StatementRef<'a>)
             // construct_full_frame when it's no longer in scope
             state.local_essen.push(LocalEssentialInfo {
                 valid: sref.scope_range(),
-                label: sref.label(),
                 string: expr,
             });
         }

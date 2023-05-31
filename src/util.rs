@@ -79,7 +79,7 @@ pub fn fast_extend<T: Copy>(vec: &mut Vec<T>, other: &[T]) {
 #[inline(always)]
 pub fn copy_portion(vec: &mut Vec<u8>, from: Range<usize>) {
     let Range { start: copy_start, end: copy_end } = from.clone();
-    &vec[from]; // for the bounds check
+    let _ = &vec[from]; // for the bounds check
     unsafe {
         let copy_len = copy_end - copy_start;
         vec.reserve(copy_len);

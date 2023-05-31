@@ -48,14 +48,8 @@ impl fmt::Display for ExportError {
 }
 
 impl error::Error for ExportError {
-    fn description(&self) -> &str {
-        match *self {
-            ExportError::Io(ref err) => err.description(),
-            ExportError::Verify(_) => "verification error",
-        }
-    }
 
-    fn cause(&self) -> Option<&error::Error> {
+    fn cause(&self) -> Option<&dyn error::Error> {
         match *self {
             ExportError::Io(ref err) => Some(err),
             ExportError::Verify(_) => None,
@@ -71,9 +65,9 @@ pub fn export_mmp<W: Write>(sset: &SegmentSet,
                             out: &mut W)
                             -> Result<(), ExportError> {
     let thm_label = stmt.label();
-    try!(writeln!(out,
+    writeln!(out,
                   "$( <MM> <PROOF_ASST> THEOREM={}  LOC_AFTER=?\n",
-                  as_str(thm_label)));
+                  as_str(thm_label))?;
     if let Some(comment) = stmt.associated_comment() {
         let mut span = comment.span();
         span.start += 2;
@@ -82,10 +76,10 @@ pub fn export_mmp<W: Write>(sset: &SegmentSet,
             .unwrap()
             .replace_all(as_str(span.as_ref(&comment.segment().segment.buffer)),
                      "\n  ");
-        try!(writeln!(out, "*{}\n", cstr));
+        writeln!(out, "*{}\n", cstr)?;
     }
 
-    let arr = try!(ProofTreeArray::new(sset, nset, scope, stmt));
+    let arr = ProofTreeArray::new(sset, nset, scope, stmt)?;
 
     // TODO remove hardcoded logical step symbol
     let provable_tc = "|-".as_bytes();
@@ -162,9 +156,9 @@ pub fn export_mmp<W: Write>(sset: &SegmentSet,
         }
         line.push_str(&str::from_utf8(&tc).unwrap());
         line.push_str(&String::from_utf8_lossy(&arr.exprs[cur]));
-        try!(writeln!(out, "{}", line));
+        writeln!(out, "{}", line)?;
     }
-    try!(writeln!(out,
+    writeln!(out,
                   "\n$={}",
                   ProofTreePrinter {
                       sset: sset,
@@ -176,8 +170,8 @@ pub fn export_mmp<W: Write>(sset: &SegmentSet,
                       initial_chr: 2,
                       indent: 6,
                       line_width: 79,
-                  }));
+                  })?;
 
-    try!(writeln!(out, "\n$)"));
+    writeln!(out, "\n$)")?;
     Ok(())
 }
