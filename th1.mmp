@@ -1,0 +1,12 @@
+$( <MM> <PROOF_ASST> THEOREM=th1  LOC_AFTER=?
+
+* Prove a theorem
+
+1::a2       |- ( t + 0 ) = t
+2::a1        |- ( ( t + 0 ) = t -> ( ( t + 0 ) = t -> t = t ) )
+3:1,2:mp    |- ( ( t + 0 ) = t -> t = t )
+qed:1,3:mp |- t = t
+
+$=    tt tze 1:tpl tt 2:weq tt tt 3:weq tt 4:a2 2 2 3 wim 4 1 tt tt a1 mp mp $.
+
+$)

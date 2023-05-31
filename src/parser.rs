@@ -105,8 +105,8 @@ impl Span {
 
     fn new2(start: FilePos, end: FilePos) -> Span {
         Span {
-            start: start,
-            end: end,
+            start,
+            end,
         }
     }
 
@@ -260,8 +260,8 @@ impl StatementAddress {
     /// Constructs a statement address from its parts.
     pub fn new(segment_id: SegmentId, index: StatementIndex) -> Self {
         StatementAddress {
-            segment_id: segment_id,
-            index: index,
+            segment_id,
+            index,
         }
     }
 }
@@ -464,7 +464,7 @@ impl<'a> SegmentRef<'a> {
         StatementRef {
             segment: self,
             statement: &self.segment.statements[index as usize],
-            index: index,
+            index,
         }
     }
 
@@ -746,7 +746,7 @@ impl<'a> Iterator for StatementIter<'a> {
             StatementRef {
                 segment: self.segment,
                 statement: st_ref,
-                index: index,
+                index,
             }
         })
     }
@@ -1011,8 +1011,8 @@ impl<'a> Scanner<'a> {
     /// statements and non-comment.
     fn out_statement(&mut self, stype: StatementType, label: Span) -> Statement {
         Statement {
-            stype: stype,
-            label: label,
+            stype,
+            label,
             math_start: self.statement_math_start,
             proof_start: self.statement_proof_start,
             proof_end: self.span_pool.len(),
@@ -1421,7 +1421,7 @@ fn collect_definitions(seg: &mut Segment) {
     for (index, &ref stmt) in seg.statements.iter().enumerate() {
         let index = index as StatementIndex;
         if stmt.stype.takes_label() {
-            seg.labels.push(LabelDef { index: index });
+            seg.labels.push(LabelDef { index });
         }
 
         if stmt.group_end != NO_STATEMENT {
@@ -1429,7 +1429,7 @@ fn collect_definitions(seg: &mut Segment) {
                 let math = &seg.span_pool[stmt.math_start..stmt.proof_start];
                 for sindex in 0..math.len() {
                     seg.local_vars.push(LocalVarDef {
-                        index: index,
+                        index,
                         ordinal: sindex as TokenIndex,
                     });
                 }

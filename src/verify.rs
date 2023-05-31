@@ -63,15 +63,6 @@ use util::HashMap;
 use util::new_map;
 use util::ptr_eq;
 
-// Proofs are very fragile and there are very few situations where errors are
-// recoverable, so we bail out using Result on any error.
-macro_rules! try_assert {
-    ( $cond:expr , $($arg:tt)+ ) => {
-        if !$cond {
-            try!(Err($($arg)+))
-        }
-    }
-}
 
 /// Preparing a step means that it can be referenced using a varint in a
 /// compressed proof.  Compressed steps are either saved prior
@@ -258,12 +249,13 @@ fn prepare_step<P: ProofBuilder>(state: &mut VerifyState<P>, label: TokenPtr) ->
     // disallow circular reasoning
     let valid = frame.valid;
     let pos = state.cur_frame.valid.start;
-    try_assert!(state.order.cmp(&pos, &valid.start) == Ordering::Greater,
-                Diagnostic::StepUsedBeforeDefinition(copy_token(label)));
+    assert!(state.order.cmp(&pos, &valid.start) == Ordering::Greater,
+                "{:?}", Diagnostic::StepUsedBeforeDefinition(copy_token(label)));
 
-    try_assert!(valid.end == NO_STATEMENT ||
+
+    assert!(valid.end == NO_STATEMENT ||
                 pos.segment_id == valid.start.segment_id && pos.index < valid.end,
-                Diagnostic::StepUsedAfterScope(copy_token(label)));
+                "{:?}", Diagnostic::StepUsedAfterScope(copy_token(label)));
 
     if frame.stype == StatementType::Axiom || frame.stype == StatementType::Provable {
         state.prepared.push(Assert(frame));
@@ -364,7 +356,7 @@ fn do_substitute_vars(expr: &[ExprFragment], vars: &[(Range<usize>, Bitset)]) ->
 /// This is the main "VM" function, and responsible for ~30% of CPU time during
 /// a one-shot verify operation.
 fn execute_step<P: ProofBuilder>(state: &mut VerifyState<P>, index: usize) -> Result<()> {
-    try_assert!(index < state.prepared.len(), Diagnostic::StepOutOfRange);
+    assert!(index < state.prepared.len(), "{:?}", Diagnostic::StepOutOfRange);
 
     let fref = match state.prepared[index] {
         Hyp(ref vars, code, ref expr, ref data) => {
@@ -373,7 +365,7 @@ fn execute_step<P: ProofBuilder>(state: &mut VerifyState<P>, index: usize) -> Re
             state.stack.push((data.clone(),
                               StackSlot {
                 vars: vars.clone(),
-                code: code,
+                code,
                 expr: expr.clone(),
             }));
             return Ok(());
@@ -381,10 +373,10 @@ fn execute_step<P: ProofBuilder>(state: &mut VerifyState<P>, index: usize) -> Re
         Assert(fref) => fref,
     };
 
-    let sbase = try!(state.stack
+    let sbase = state.stack
         .len()
         .checked_sub(fref.hypotheses.len())
-        .ok_or(Diagnostic::ProofUnderflow));
+        .ok_or(Diagnostic::ProofUnderflow)?;
 
     while state.subst_info.len() < fref.mandatory_count {
         // this is mildly unhygenic, since slots corresponding to $e hyps won't get cleared, but
@@ -407,17 +399,17 @@ fn execute_step<P: ProofBuilder>(state: &mut VerifyState<P>, index: usize) -> Re
         state.builder.push(&mut datavec, data.clone());
         match hyp {
             &Floating(_addr, var_index, typecode) => {
-                try_assert!(slot.code == typecode, Diagnostic::StepFloatWrongType);
+                assert!(slot.code == typecode, "{:?}", Diagnostic::StepFloatWrongType);
                 state.subst_info[var_index] = (slot.expr.clone(), slot.vars.clone());
             }
             &Essential(_addr, ref expr) => {
-                try_assert!(slot.code == expr.typecode, Diagnostic::StepEssenWrongType);
-                try_assert!(do_substitute_eq(&state.stack_buffer[slot.expr.clone()],
+                assert!(slot.code == expr.typecode, "{:?}", Diagnostic::StepEssenWrongType);
+                assert!(do_substitute_eq(&state.stack_buffer[slot.expr.clone()],
                                              fref,
                                              &expr,
                                              &state.subst_info,
                                              &state.stack_buffer),
-                            Diagnostic::StepEssenWrong);
+                            "{:?}", Diagnostic::StepEssenWrong);
             }
         }
     }
@@ -449,8 +441,8 @@ fn execute_step<P: ProofBuilder>(state: &mut VerifyState<P>, index: usize) -> Re
     for &(ix1, ix2) in &*fref.mandatory_dv {
         for var1 in &state.subst_info[ix1].1 {
             for var2 in &state.subst_info[ix2].1 {
-                try_assert!(var1 < state.dv_map.len() && state.dv_map[var1].has_bit(var2),
-                            Diagnostic::ProofDvViolation);
+                assert!(var1 < state.dv_map.len() && state.dv_map[var1].has_bit(var2),
+                        "{:?}", Diagnostic::ProofDvViolation);
             }
         }
     }
@@ -460,17 +452,17 @@ fn execute_step<P: ProofBuilder>(state: &mut VerifyState<P>, index: usize) -> Re
 
 fn finalize_step<P: ProofBuilder>(state: &mut VerifyState<P>) -> Result<P::Item> {
     // if we get here, it's a valid proof, but was it the _right_ valid proof?
-    try_assert!(state.stack.len() <= 1, Diagnostic::ProofExcessEnd);
-    let &(ref data, ref tos) = try!(state.stack.last().ok_or(Diagnostic::ProofNoSteps));
+    assert!(state.stack.len() <= 1, "{:?}", Diagnostic::ProofExcessEnd);
+    let &(ref data, ref tos) = state.stack.last().ok_or(Diagnostic::ProofNoSteps)?;
 
-    try_assert!(tos.code == state.cur_frame.target.typecode,
-                Diagnostic::ProofWrongTypeEnd);
+    assert!(tos.code == state.cur_frame.target.typecode,
+                "{:?}", Diagnostic::ProofWrongTypeEnd);
 
     fast_clear(&mut state.temp_buffer);
     do_substitute_raw(&mut state.temp_buffer, &state.cur_frame, state.nameset);
 
-    try_assert!(state.stack_buffer[tos.expr.clone()] == state.temp_buffer[..],
-                Diagnostic::ProofWrongExprEnd);
+    assert!(state.stack_buffer[tos.expr.clone()] == state.temp_buffer[..],
+                "{:?}", Diagnostic::ProofWrongExprEnd);
 
     Ok(data.clone())
 }
@@ -512,7 +504,7 @@ fn verify_proof<'a, P: ProofBuilder>(state: &mut VerifyState<'a, P>,
 
         // parse and prepare the label list before the )
         loop {
-            try_assert!(i < stmt.proof_len(), Diagnostic::ProofUnterminatedRoster);
+            assert!(i < stmt.proof_len(), "{:?}", Diagnostic::ProofUnterminatedRoster);
             let chunk = stmt.proof_slice_at(i);
             i += 1;
 
@@ -520,7 +512,7 @@ fn verify_proof<'a, P: ProofBuilder>(state: &mut VerifyState<'a, P>,
                 break;
             }
 
-            try!(prepare_step(state, chunk));
+            prepare_step(state, chunk)?;
         }
 
         // after ) is a packed list of varints.  decode them and execute the
@@ -533,35 +525,35 @@ fn verify_proof<'a, P: ProofBuilder>(state: &mut VerifyState<'a, P>,
             for &ch in chunk {
                 if ch >= b'A' && ch <= b'T' {
                     k = k * 20 + (ch - b'A') as usize;
-                    try!(execute_step(state, k));
+                    execute_step(state, k)?;
                     k = 0;
                     can_save = true;
                 } else if ch >= b'U' && ch <= b'Y' {
                     k = k * 5 + 1 + (ch - b'U') as usize;
-                    try_assert!(k < (u32::max_value() as usize / 20) - 1,
-                                Diagnostic::ProofMalformedVarint);
+                    assert!(k < (u32::max_value() as usize / 20) - 1,
+                                "{:?}", Diagnostic::ProofMalformedVarint);
                     can_save = false;
                 } else if ch == b'Z' {
-                    try_assert!(can_save, Diagnostic::ProofInvalidSave);
+                    assert!(can_save, "{:?}", Diagnostic::ProofInvalidSave);
                     save_step(state);
                     can_save = false;
                 } else if ch == b'?' {
-                    try_assert!(k == 0, Diagnostic::ProofMalformedVarint);
+                    assert!(k == 0, "{:?}", Diagnostic::ProofMalformedVarint);
                     return Err(Diagnostic::ProofIncomplete);
                 }
             }
             i += 1;
         }
 
-        try_assert!(k == 0, Diagnostic::ProofMalformedVarint);
+        assert!(k == 0, "{:?}", Diagnostic::ProofMalformedVarint);
     } else {
         let mut count = 0;
         // NORMAL mode proofs are just a list of steps, with no saving provision
         for i in 0..stmt.proof_len() {
             let chunk = stmt.proof_slice_at(i);
-            try_assert!(chunk != b"?", Diagnostic::ProofIncomplete);
-            try!(prepare_step(state, chunk));
-            try!(execute_step(state, count));
+            assert!(chunk != b"?", "{:?}", Diagnostic::ProofIncomplete);
+            prepare_step(state, chunk)?;
+            execute_step(state, count)?;
             count += 1;
         }
     }
@@ -635,7 +627,7 @@ fn verify_segment(sset: &SegmentSet,
     }
     VerifySegment {
         source: (*sref).clone(),
-        diagnostics: diagnostics,
+        diagnostics,
         scope_usage: state.scoper.into_usage(),
     }
 }
@@ -688,7 +680,7 @@ pub fn verify_one<P: ProofBuilder>(sset: &SegmentSet,
         this_seg: stmt.segment(),
         scoper: ScopeReader::new(scopes),
         nameset: nset,
-        builder: builder,
+        builder,
         order: &sset.order,
         cur_frame: &dummy_frame,
         stack: Vec::new(),
